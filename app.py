@@ -35,7 +35,7 @@ Esta app:
 4. Genera un ZIP con:
    - `detalle_eta_ata_por_contenedor.csv` (detalle por contenedor, sólo válidos)
    - `resumen_por_bl.csv` (una fila por Bill of lading)
-   - `tabla_resumen_bls.csv` (tabla resumen en número de BL y % sobre válidos)
+   - `tabla_resumen_bls.csv` (tabla resumen en número de BL y % sobre BL válidos, usando Shipment ID)
 """
 )
 
@@ -88,7 +88,9 @@ if uploaded_file is not None:
 
             # === PASO 1: contar BL únicos (Shipment ID, filas Bill_of_lading) ===
             mask_bl_header = df[col_shipment_type].str.strip().str.upper() == "BILL_OF_LADING"
-            total_bls_shipment = df.loc[mask_bl_header, col_shipment_id].nunique()
+            all_shipments_series = df.loc[mask_bl_header, col_shipment_id].astype(str)
+            all_shipments_set = set(all_shipments_series.unique())
+            total_bls_shipment = len(all_shipments_set)
 
             st.subheader("Resumen de Bill of Lading (usando Shipment ID)")
             st.write("Cantidad de BL únicos (Shipment ID donde Shipment type = 'Bill_of_lading'):")
@@ -110,7 +112,7 @@ if uploaded_file is not None:
                     f"Se detectaron {len(containers)} filas de contenedores."
                 )
 
-                # === PASO 2: ETA/ATA ===
+                # === PASO 2: ETA/ATA (prioriza ATA, luego ETA) ===
                 containers["eta_dt"] = pd.to_datetime(containers[col_eta], errors="coerce")
                 containers["ata_dt"] = pd.to_datetime(containers[col_ata], errors="coerce")
 
@@ -191,29 +193,31 @@ if uploaded_file is not None:
                             .reset_index()
                         )
 
-                        # === TABLA RESUMEN (NUEVA) EN NÚMERO DE BL Y % SOBRE VÁLIDOS ===
-                        # BoL totales: distintos en columna C entre filas de contenedores
-                        all_bls_series = df.loc[mask_containers, col_bol].astype(str)
-                        all_bls_set = set(all_bls_series.unique())
-                        total_bls_totales = len(all_bls_set)
+                        # === TABLA RESUMEN (NUEVA) USANDO SHIPMENT ID COMO UNIDAD ===
+                        # 1) BL Totales: Shipment ID únicos con fila Bill_of_lading
+                        total_bls_totales = total_bls_shipment
 
-                        # BoL válidos: los que aparecen en 'resumen'
-                        valid_bls_series = resumen[col_bol].astype(str)
-                        valid_bls_set = set(valid_bls_series.unique())
-                        total_bls_validos = len(valid_bls_set)
+                        # 2) BL válidos: Shipment ID que tienen al menos un contenedor con ETA/ATA válida
+                        valid_shipments_series = valid[col_shipment_id].astype(str)
+                        valid_shipments_set = set(valid_shipments_series.unique())
+                        total_bls_validos = len(valid_shipments_set)
 
-                        # BoL no válidos: totales - válidos
-                        non_valid_bls_set = all_bls_set - valid_bls_set
-                        total_bls_no_validos = len(non_valid_bls_set)
+                        # 3) BL no válidos: totales - válidos
+                        non_valid_shipments_set = all_shipments_set - valid_shipments_set
+                        total_bls_no_validos = len(non_valid_shipments_set)
 
-                        # BL con diferencias (Rango != 'Sin diferencia')
-                        bl_con_diferencias = (resumen["Rango"] != "Sin diferencia").sum()
+                        # 4) Categorías de diferencia por Shipment ID (usando Rango del BL)
+                        ship_summary = (
+                            valid.groupby(col_shipment_id, dropna=False)
+                            .agg(Rango=("Rango", "first"))
+                            .reset_index()
+                        )
 
-                        # BL diferencia < 24 horas
-                        bl_diff_menor_24 = (resumen["Rango"] == "Menos de 24 Hrs").sum()
-
-                        # BL diferencia > 24 horas
-                        bl_diff_mayor_24 = (resumen["Rango"] == "Mas de 24 Hrs").sum()
+                        # Aseguramos que solo contamos Shipment ID válidos (aparecen en 'valid')
+                        # ship_summary rows == valid shipment IDs
+                        bl_con_diferencias = (ship_summary["Rango"] != "Sin diferencia").sum()
+                        bl_diff_menor_24 = (ship_summary["Rango"] == "Menos de 24 Hrs").sum()
+                        bl_diff_mayor_24 = (ship_summary["Rango"] == "Mas de 24 Hrs").sum()
 
                         rows = []
 
@@ -222,10 +226,10 @@ if uploaded_file is not None:
                                 return None
                             return round((count / total_bls_validos) * 100, 2)
 
-                        # 1) Bill of Lading Totales
+                        # 1) Bill of Lading Totales (Shipment ID)
                         rows.append(
                             {
-                                "indicador": "Bill of Lading Totales",
+                                "indicador": "Bill of Lading Totales (Shipment ID, Bill_of_lading)",
                                 "cantidad": int(total_bls_totales),
                                 "porcentaje_sobre_validos": "",
                             }
@@ -234,7 +238,7 @@ if uploaded_file is not None:
                         # 2) Bill of Lading Totales Válidos
                         rows.append(
                             {
-                                "indicador": "Bill of Lading Totales Válidos (ETA/ATA válida)",
+                                "indicador": "Bill of Lading Totales Válidos (con ETA/ATA válida)",
                                 "cantidad": int(total_bls_validos),
                                 "porcentaje_sobre_validos": pct_valid(total_bls_validos),
                             }
