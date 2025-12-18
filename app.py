@@ -68,7 +68,7 @@ Lógica principal:
 uploaded_file = st.file_uploader("Sube el CSV de movimientos (export Movement)", type=["csv"])
 
 
-def clasificar_rango(horas: float | None) -> str:
+def clasificar_rango(horas):
     """Clasifica la diferencia en horas en los rangos pedidos."""
     if horas is None or pd.isna(horas):
         return ""
@@ -157,4 +157,246 @@ if uploaded_file is not None:
                 ]
 
                 # Inicializar ETA/ATA en todo el df
-                df["ETA/ATA"] = "ETA/ATA Invalido
+                df["ETA/ATA"] = "ETA/ATA Invalido"
+
+                # Contenedores con ETA/ATA no vacía (válidos para análisis)
+                mask_valid_etaata_str = (
+                    containers["etaata_str"].notna()
+                    & (containers["etaata_str"].str.strip() != "")
+                )
+                containers_valid = containers.loc[mask_valid_etaata_str].copy()
+
+                st.write(
+                    f"Contenedores con ETA/ATA no vacía (válidos para análisis): "
+                    f"**{len(containers_valid)}**"
+                )
+
+                if containers_valid.empty:
+                    st.warning("No hay contenedores con ETA/ATA no vacía (todos ETA/ATA Invalido).")
+                else:
+                    # Escribir ETA/ATA en df original
+                    df.loc[containers_valid.index, "ETA/ATA"] = containers_valid["etaata_str"]
+
+                    # ==== 5. Subconjunto 'valid' = contenedores con ETA/ATA válida ====
+                    mask_valid_rows = mask_containers & (df["ETA/ATA"] != "ETA/ATA Invalido")
+                    valid = df.loc[mask_valid_rows].copy()
+
+                    if valid.empty:
+                        st.warning(
+                            "No hay filas de contenedores con ETA/ATA válida después del filtrado."
+                        )
+                    else:
+                        # Normalizar BoL en 'valid'
+                        valid["bol_norm"] = valid[col_bol].astype(str).str.strip()
+
+                        # ==== 6. Parsear ETA/ATA a datetime y calcular Min/Max por BoL (col C) ====
+                        valid["etaata_dt"] = pd.to_datetime(
+                            valid["ETA/ATA"], errors="coerce"
+                        )
+
+                        group_bol = valid.groupby("bol_norm", dropna=False)
+                        bol_stats = group_bol.agg(
+                            shipment_id_count=(col_shipment_id, lambda s: s.astype(str).str.strip().nunique()),
+                            containers_valid=("ETA/ATA", "size"),
+                            min_dt=("etaata_dt", "min"),
+                            max_dt=("etaata_dt", "max"),
+                        ).reset_index()
+
+                        bol_stats["diferencia_horas"] = (
+                            (bol_stats["max_dt"] - bol_stats["min_dt"]).dt.total_seconds()
+                            / 3600.0
+                        )
+                        bol_stats["Rango"] = bol_stats["diferencia_horas"].apply(clasificar_rango)
+
+                        # Convertir Min/Max a string
+                        bol_stats["Min"] = bol_stats["min_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
+                        bol_stats["Max"] = bol_stats["max_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                        # ---- DataFrame resumen por BoL (para CSV) ----
+                        resumen_por_bl = bol_stats.rename(columns={"bol_norm": col_bol})[
+                            [
+                                col_bol,
+                                "shipment_id_count",
+                                "containers_valid",
+                                "Min",
+                                "Max",
+                                "diferencia_horas",
+                                "Rango",
+                            ]
+                        ].copy()
+
+                        # ==== 7. Escribir Min/Max/diferencia/Rango en df detalle (a nivel contenedor) ====
+                        # Hacemos un merge por bol_norm
+                        valid = valid.merge(
+                            bol_stats[["bol_norm", "Min", "Max", "diferencia_horas", "Rango"]],
+                            on="bol_norm",
+                            how="left",
+                            suffixes=("", "_agg"),
+                        )
+
+                        # Copiar al df original
+                        df.loc[valid.index, "Min"] = valid["Min"]
+                        df.loc[valid.index, "Max"] = valid["Max"]
+                        df.loc[valid.index, "diferencia"] = valid["diferencia_horas"]
+                        df.loc[valid.index, "Rango"] = valid["Rango"]
+
+                        # CSV detalle = solo contenedores con ETA/ATA válida
+                        detalle = df.loc[valid.index].copy()
+
+                        # ==== 8. Tabla resumen pedida (a nivel Shipment ID) ====
+
+                        # 8.1 BL Totales Base: Shipment ID únicos con Shipment type = Bill_of_lading
+                        total_bl_base = len(base_shipments)
+
+                        # 8.2 BL válidos (universo prueba):
+                        # Shipment ID de base que estén asociados a un BoL con ETA/ATA válida
+
+                        # Set de BoL válidos (BoL que aparecen en bol_stats)
+                        valid_bols_set = set(bol_stats["bol_norm"].astype(str).unique())
+
+                        # Filtramos cabeceras para Shipment ID - BoL y nos quedamos con los válidos
+                        header_norm = header_df[["shipment_id_norm", "bol_norm"]].drop_duplicates()
+                        valid_shipments = header_norm[
+                            header_norm["bol_norm"].astype(str).isin(valid_bols_set)
+                        ]["shipment_id_norm"].unique()
+
+                        total_bl_validos = len(valid_shipments)
+
+                        # 8.3 Diferencia (BL no válidos) = base - válidos
+                        total_bl_no_validos = total_bl_base - total_bl_validos
+
+                        # 8.4 Diferencias por Shipment ID (usando diferencia_horas del BoL)
+                        # Merge: Shipment ID (cabecera) + bol_norm + diferencia_horas (por BoL)
+                        ship_bol_diff = header_norm.merge(
+                            bol_stats[["bol_norm", "diferencia_horas"]],
+                            on="bol_norm",
+                            how="left",
+                        )
+
+                        # Nos quedamos solo con los Shipment ID válidos (universo prueba)
+                        ship_bol_diff = ship_bol_diff[
+                            ship_bol_diff["shipment_id_norm"].isin(valid_shipments)
+                        ].drop_duplicates(subset=["shipment_id_norm"])
+
+                        # Umbral de 1 minuto en horas
+                        one_minute_hours = 1.0 / 60.0
+
+                        bl_con_diferencias = (
+                            ship_bol_diff["diferencia_horas"] > one_minute_hours
+                        ).sum()
+
+                        bl_diff_menor_24 = (
+                            (ship_bol_diff["diferencia_horas"] > one_minute_hours)
+                            & (ship_bol_diff["diferencia_horas"] <= 24)
+                        ).sum()
+
+                        bl_diff_mayor_24 = (
+                            ship_bol_diff["diferencia_horas"] > 24
+                        ).sum()
+
+                        # Construir tabla_resumen_bls
+                        rows = []
+
+                        def pct_valid(count):
+                            if total_bl_validos == 0:
+                                return None
+                            return round((count / total_bl_validos) * 100, 2)
+
+                        # #BL Totales Base
+                        rows.append(
+                            {
+                                "indicador": "#BL Totales Base (Shipment ID, Shipment type = Bill_of_lading)",
+                                "cantidad": int(total_bl_base),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # #BL Válidos (universo prueba)
+                        rows.append(
+                            {
+                                "indicador": "#BL Válidos (universo prueba, con ETA/ATA válida)",
+                                "cantidad": int(total_bl_validos),
+                                "porcentaje_sobre_validos": pct_valid(total_bl_validos),
+                            }
+                        )
+
+                        # Diferencia (BL no válidos)
+                        rows.append(
+                            {
+                                "indicador": "Diferencia (BL no válidos)",
+                                "cantidad": int(total_bl_no_validos),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # BL con diferencias ETA/ATA (> 1 minuto)
+                        rows.append(
+                            {
+                                "indicador": "BL con diferencias ETA/ATA (> 1 minuto)",
+                                "cantidad": int(bl_con_diferencias),
+                                "porcentaje_sobre_validos": pct_valid(bl_con_diferencias),
+                            }
+                        )
+
+                        # BL diferencia de menos de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de menos de 24 horas (1 min < diff ≤ 24 h)",
+                                "cantidad": int(bl_diff_menor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_menor_24),
+                            }
+                        )
+
+                        # BL diferencia de más de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de más de 24 horas (diff > 24 h)",
+                                "cantidad": int(bl_diff_mayor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_mayor_24),
+                            }
+                        )
+
+                        tabla_resumen = pd.DataFrame(
+                            rows,
+                            columns=["indicador", "cantidad", "porcentaje_sobre_validos"],
+                        )
+
+                        # ==== 9. Construir ZIP con los 3 CSV ====
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(
+                            zip_buffer, "w", compression=zipfile.ZIP_DEFLATED
+                        ) as zf:
+                            zf.writestr(
+                                "detalle_eta_ata_por_contenedor.csv",
+                                detalle.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                            zf.writestr(
+                                "resumen_por_bl.csv",
+                                resumen_por_bl.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                            zf.writestr(
+                                "tabla_resumen_bls.csv",
+                                tabla_resumen.to_csv(index=False).encode("utf-8-sig"),
+                            )
+
+                        zip_buffer.seek(0)
+
+                        st.success("Análisis completado. Puedes descargar el ZIP con los tres CSV.")
+                        st.download_button(
+                            label="Descargar ZIP (detalle + resumen por BL + tabla resumen)",
+                            data=zip_buffer,
+                            file_name="reporte_bl_eta_ata.zip",
+                            mime="application/zip",
+                        )
+
+                        st.subheader("Tabla resumen (vista rápida)")
+                        st.dataframe(tabla_resumen)
+
+                        st.subheader("Resumen por BL (vista rápida)")
+                        st.dataframe(resumen_por_bl.head(50))
+
+    except Exception as e:
+        st.error(f"Error procesando el archivo: {e}")
+
+else:
+    st.info("Sube un archivo CSV para comenzar.")
