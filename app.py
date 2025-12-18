@@ -23,9 +23,9 @@ Esta app:
 
 3. Solo con filas donde `ETA/ATA` tiene un valor (no `BL Invalido`):
    - Agrupa por **Bill of lading** (columna C).
-   - Calcula:
-     - `Min` = fecha/hora mínima ETA/ATA por BL.
-     - `Max` = fecha/hora máxima ETA/ATA por BL.
+   - Calcula por cada BL:
+     - `Min` = fecha/hora mínima ETA/ATA.
+     - `Max` = fecha/hora máxima ETA/ATA.
      - `diferencia` = (Max - Min) en horas.
      - `Rango`:
        - `Sin diferencia` → 0 horas
@@ -35,6 +35,7 @@ Esta app:
 4. Genera un ZIP con:
    - `detalle_eta_ata_por_contenedor.csv` (detalle por contenedor, sólo válidos)
    - `resumen_por_bl.csv` (una fila por Bill of lading)
+   - `tabla_resumen_bls.csv` (tabla resumen en número de BL y % sobre válidos)
 """
 )
 
@@ -87,11 +88,11 @@ if uploaded_file is not None:
 
             # === PASO 1: contar BL únicos (Shipment ID, filas Bill_of_lading) ===
             mask_bl_header = df[col_shipment_type].str.strip().str.upper() == "BILL_OF_LADING"
-            total_bls = df.loc[mask_bl_header, col_shipment_id].nunique()
+            total_bls_shipment = df.loc[mask_bl_header, col_shipment_id].nunique()
 
             st.subheader("Resumen de Bill of Lading (usando Shipment ID)")
-            st.write(f"Cantidad de BL únicos (Shipment ID donde Shipment type = 'Bill_of_lading'):")
-            st.metric(label="BL únicos", value=int(total_bls))
+            st.write("Cantidad de BL únicos (Shipment ID donde Shipment type = 'Bill_of_lading'):")
+            st.metric(label="BL únicos (Shipment ID)", value=int(total_bls_shipment))
 
             # === FILAS DE CONTENEDORES ===
             mask_containers = df[col_shipment_type].str.strip().str.upper().isin(
@@ -190,6 +191,96 @@ if uploaded_file is not None:
                             .reset_index()
                         )
 
+                        # === TABLA RESUMEN (NUEVA) EN NÚMERO DE BL Y % SOBRE VÁLIDOS ===
+                        # BoL totales: distintos en columna C entre filas de contenedores
+                        all_bls_series = df.loc[mask_containers, col_bol].astype(str)
+                        all_bls_set = set(all_bls_series.unique())
+                        total_bls_totales = len(all_bls_set)
+
+                        # BoL válidos: los que aparecen en 'resumen'
+                        valid_bls_series = resumen[col_bol].astype(str)
+                        valid_bls_set = set(valid_bls_series.unique())
+                        total_bls_validos = len(valid_bls_set)
+
+                        # BoL no válidos: totales - válidos
+                        non_valid_bls_set = all_bls_set - valid_bls_set
+                        total_bls_no_validos = len(non_valid_bls_set)
+
+                        # BL con diferencias (Rango != 'Sin diferencia')
+                        bl_con_diferencias = (resumen["Rango"] != "Sin diferencia").sum()
+
+                        # BL diferencia < 24 horas
+                        bl_diff_menor_24 = (resumen["Rango"] == "Menos de 24 Hrs").sum()
+
+                        # BL diferencia > 24 horas
+                        bl_diff_mayor_24 = (resumen["Rango"] == "Mas de 24 Hrs").sum()
+
+                        rows = []
+
+                        def pct_valid(count):
+                            if total_bls_validos == 0:
+                                return None
+                            return round((count / total_bls_validos) * 100, 2)
+
+                        # 1) Bill of Lading Totales
+                        rows.append(
+                            {
+                                "indicador": "Bill of Lading Totales",
+                                "cantidad": int(total_bls_totales),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # 2) Bill of Lading Totales Válidos
+                        rows.append(
+                            {
+                                "indicador": "Bill of Lading Totales Válidos (ETA/ATA válida)",
+                                "cantidad": int(total_bls_validos),
+                                "porcentaje_sobre_validos": pct_valid(total_bls_validos),
+                            }
+                        )
+
+                        # 3) Diferencia (BL no válidos)
+                        rows.append(
+                            {
+                                "indicador": "Diferencia (BL no válidos)",
+                                "cantidad": int(total_bls_no_validos),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # 4) BL con diferencias ETA/ATA
+                        rows.append(
+                            {
+                                "indicador": "BL con diferencias ETA/ATA (Rango ≠ 'Sin diferencia')",
+                                "cantidad": int(bl_con_diferencias),
+                                "porcentaje_sobre_validos": pct_valid(bl_con_diferencias),
+                            }
+                        )
+
+                        # 5) BL diferencia de menos de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de menos de 24 horas",
+                                "cantidad": int(bl_diff_menor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_menor_24),
+                            }
+                        )
+
+                        # 6) BL diferencia de más de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de más de 24 horas",
+                                "cantidad": int(bl_diff_mayor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_mayor_24),
+                            }
+                        )
+
+                        tabla_resumen = pd.DataFrame(
+                            rows,
+                            columns=["indicador", "cantidad", "porcentaje_sobre_validos"],
+                        )
+
                         # === CONSTRUIR ZIP EN MEMORIA ===
                         zip_buffer = io.BytesIO()
                         with zipfile.ZipFile(
@@ -203,16 +294,23 @@ if uploaded_file is not None:
                                 "resumen_por_bl.csv",
                                 resumen.to_csv(index=False).encode("utf-8-sig"),
                             )
+                            zf.writestr(
+                                "tabla_resumen_bls.csv",
+                                tabla_resumen.to_csv(index=False).encode("utf-8-sig"),
+                            )
 
                         zip_buffer.seek(0)
 
-                        st.success("Análisis completado. Puedes descargar el ZIP con los dos CSV.")
+                        st.success("Análisis completado. Puedes descargar el ZIP con los tres CSV.")
                         st.download_button(
-                            label="Descargar ZIP (detalle + resumen)",
+                            label="Descargar ZIP (detalle + resumen por BL + tabla resumen)",
                             data=zip_buffer,
                             file_name="reporte_bl_eta_ata.zip",
                             mime="application/zip",
                         )
+
+                        st.subheader("Tabla resumen (vista rápida)")
+                        st.dataframe(tabla_resumen)
 
                         st.subheader("Resumen por BL (vista rápida)")
                         st.dataframe(resumen.head(50))
