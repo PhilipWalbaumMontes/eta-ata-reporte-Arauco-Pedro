@@ -47,7 +47,7 @@ Lógica principal:
      - `Shipment ID` únicos con `Shipment type = Bill_of_lading`.
 
    - **#BL Válidos (universo prueba)**  
-     - Esos mismos `Shipment ID`, pero cuyos BoL (columna C) tienen al menos un contenedor con ETA/ATA válida.
+     - Esos mismos `Shipment ID`, pero cuyos BoL (columna C) tienen al menos un contenedor con ETA/ATA válida **y parseable como fecha/hora**.
 
    - **Diferencia (BL no válidos)**  
      - Base − Válidos.
@@ -159,7 +159,7 @@ if uploaded_file is not None:
                 # Inicializar ETA/ATA en todo el df
                 df["ETA/ATA"] = "ETA/ATA Invalido"
 
-                # Contenedores con ETA/ATA no vacía (válidos para análisis)
+                # Contenedores con ETA/ATA no vacía (válidos para análisis de presencia)
                 mask_valid_etaata_str = (
                     containers["etaata_str"].notna()
                     & (containers["etaata_str"].str.strip() != "")
@@ -177,7 +177,7 @@ if uploaded_file is not None:
                     # Escribir ETA/ATA en df original
                     df.loc[containers_valid.index, "ETA/ATA"] = containers_valid["etaata_str"]
 
-                    # ==== 5. Subconjunto 'valid' = contenedores con ETA/ATA válida ====
+                    # ==== 5. Subconjunto 'valid' = contenedores con ETA/ATA válida (no Invalido) ====
                     mask_valid_rows = mask_containers & (df["ETA/ATA"] != "ETA/ATA Invalido")
                     valid = df.loc[mask_valid_rows].copy()
 
@@ -196,24 +196,33 @@ if uploaded_file is not None:
 
                         group_bol = valid.groupby("bol_norm", dropna=False)
                         bol_stats = group_bol.agg(
-                            shipment_id_count=(col_shipment_id, lambda s: s.astype(str).str.strip().nunique()),
+                            shipment_id_count=(
+                                col_shipment_id,
+                                lambda s: s.astype(str).str.strip().nunique(),
+                            ),
                             containers_valid=("ETA/ATA", "size"),
                             min_dt=("etaata_dt", "min"),
                             max_dt=("etaata_dt", "max"),
                         ).reset_index()
 
+                        # Diferencia en horas y rango
                         bol_stats["diferencia_horas"] = (
                             (bol_stats["max_dt"] - bol_stats["min_dt"]).dt.total_seconds()
                             / 3600.0
                         )
                         bol_stats["Rango"] = bol_stats["diferencia_horas"].apply(clasificar_rango)
 
-                        # Convertir Min/Max a string
+                        # Min/Max en string
                         bol_stats["Min"] = bol_stats["min_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
                         bol_stats["Max"] = bol_stats["max_dt"].dt.strftime("%Y-%m-%d %H:%M:%S")
 
-                        # ---- DataFrame resumen por BoL (para CSV) ----
-                        resumen_por_bl = bol_stats.rename(columns={"bol_norm": col_bol})[
+                        # ==== NUEVO: quedarnos sólo con BoL donde min_dt y max_dt son parseables ====
+                        bol_stats_valid = bol_stats[
+                            bol_stats["min_dt"].notna() & bol_stats["max_dt"].notna()
+                        ].copy()
+
+                        # ---- DataFrame resumen por BoL (solo BoL con fechas parseadas) ----
+                        resumen_por_bl = bol_stats_valid.rename(columns={"bol_norm": col_bol})[
                             [
                                 col_bol,
                                 "shipment_id_count",
@@ -226,9 +235,9 @@ if uploaded_file is not None:
                         ].copy()
 
                         # ==== 7. Escribir Min/Max/diferencia/Rango en df detalle (a nivel contenedor) ====
-                        # Hacemos un merge por bol_norm
+                        # Hacemos un merge por bol_norm usando sólo bol_stats_valid
                         valid = valid.merge(
-                            bol_stats[["bol_norm", "Min", "Max", "diferencia_horas", "Rango"]],
+                            bol_stats_valid[["bol_norm", "Min", "Max", "diferencia_horas", "Rango"]],
                             on="bol_norm",
                             how="left",
                             suffixes=("", "_agg"),
@@ -249,10 +258,10 @@ if uploaded_file is not None:
                         total_bl_base = len(base_shipments)
 
                         # 8.2 BL válidos (universo prueba):
-                        # Shipment ID de base que estén asociados a un BoL con ETA/ATA válida
+                        # Shipment ID de base que estén asociados a un BoL con ETA/ATA válida Y parseable
 
-                        # Set de BoL válidos (BoL que aparecen en bol_stats)
-                        valid_bols_set = set(bol_stats["bol_norm"].astype(str).unique())
+                        # Set de BoL válidos (BoL que aparecen en bol_stats_valid)
+                        valid_bols_set = set(bol_stats_valid["bol_norm"].astype(str).unique())
 
                         # Filtramos cabeceras para Shipment ID - BoL y nos quedamos con los válidos
                         header_norm = header_df[["shipment_id_norm", "bol_norm"]].drop_duplicates()
@@ -265,10 +274,9 @@ if uploaded_file is not None:
                         # 8.3 Diferencia (BL no válidos) = base - válidos
                         total_bl_no_validos = total_bl_base - total_bl_validos
 
-                        # 8.4 Diferencias por Shipment ID (usando diferencia_horas del BoL)
-                        # Merge: Shipment ID (cabecera) + bol_norm + diferencia_horas (por BoL)
+                        # 8.4 Diferencias por Shipment ID (usando diferencia_horas del BoL, sólo parseables)
                         ship_bol_diff = header_norm.merge(
-                            bol_stats[["bol_norm", "diferencia_horas"]],
+                            bol_stats_valid[["bol_norm", "diferencia_horas"]],
                             on="bol_norm",
                             how="left",
                         )
@@ -314,7 +322,7 @@ if uploaded_file is not None:
                         # #BL Válidos (universo prueba)
                         rows.append(
                             {
-                                "indicador": "#BL Válidos (universo prueba, con ETA/ATA válida)",
+                                "indicador": "#BL Válidos (universo prueba, con ETA/ATA válida y parseable)",
                                 "cantidad": int(total_bl_validos),
                                 "porcentaje_sobre_validos": pct_valid(total_bl_validos),
                             }
