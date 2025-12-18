@@ -86,15 +86,15 @@ if uploaded_file is not None:
             st.write(f"- ETA destino (AJ): **{col_eta}**")
             st.write(f"- ATA destino (AK): **{col_ata}**")
 
-            # === PASO 1: contar BL únicos (Shipment ID, filas Bill_of_lading) ===
+            # === PASO 1: BL totales según Shipment ID y Bill_of_lading ===
             mask_bl_header = df[col_shipment_type].str.strip().str.upper() == "BILL_OF_LADING"
             all_shipments_series = df.loc[mask_bl_header, col_shipment_id].astype(str)
             all_shipments_set = set(all_shipments_series.unique())
-            total_bls_shipment = len(all_shipments_set)
+            total_bls_totales = len(all_shipments_set)
 
             st.subheader("Resumen de Bill of Lading (usando Shipment ID)")
             st.write("Cantidad de BL únicos (Shipment ID donde Shipment type = 'Bill_of_lading'):")
-            st.metric(label="BL únicos (Shipment ID)", value=int(total_bls_shipment))
+            st.metric(label="BL únicos (Shipment ID)", value=int(total_bls_totales))
 
             # === FILAS DE CONTENEDORES ===
             mask_containers = df[col_shipment_type].str.strip().str.upper().isin(
@@ -193,28 +193,29 @@ if uploaded_file is not None:
                             .reset_index()
                         )
 
-                        # === TABLA RESUMEN (NUEVA) USANDO SHIPMENT ID COMO UNIDAD ===
-                        # 1) BL Totales: Shipment ID únicos con fila Bill_of_lading
-                        total_bls_totales = total_bls_shipment
+                        # === TABLA RESUMEN (USANDO SHIPMENT ID COMO UNIDAD) ===
 
-                        # 2) BL válidos: Shipment ID que tienen al menos un contenedor con ETA/ATA válida
-                        valid_shipments_series = valid[col_shipment_id].astype(str)
-                        valid_shipments_set = set(valid_shipments_series.unique())
+                        # Shipment ID válidos = los que tienen al menos un contenedor con ETA/ATA válida
+                        valid_shipments_series_raw = valid[col_shipment_id].astype(str)
+                        valid_shipments_set_raw = set(valid_shipments_series_raw.unique())
+
+                        # Nos quedamos sólo con los Shipment ID que además tienen fila Bill_of_lading
+                        valid_shipments_set = all_shipments_set & valid_shipments_set_raw
                         total_bls_validos = len(valid_shipments_set)
 
-                        # 3) BL no válidos: totales - válidos
+                        # BL no válidos = totales - válidos (siempre sobre Shipment ID con Bill_of_lading)
                         non_valid_shipments_set = all_shipments_set - valid_shipments_set
                         total_bls_no_validos = len(non_valid_shipments_set)
 
-                        # 4) Categorías de diferencia por Shipment ID (usando Rango del BL)
+                        # Resumen de rangos por Shipment ID, restringido a los válidos
                         ship_summary = (
-                            valid.groupby(col_shipment_id, dropna=False)
+                            valid[valid[col_shipment_id].astype(str).isin(valid_shipments_set)]
+                            .groupby(col_shipment_id, dropna=False)
                             .agg(Rango=("Rango", "first"))
                             .reset_index()
                         )
 
-                        # Aseguramos que solo contamos Shipment ID válidos (aparecen en 'valid')
-                        # ship_summary rows == valid shipment IDs
+                        # Contadores por rango (solo BL válidos)
                         bl_con_diferencias = (ship_summary["Rango"] != "Sin diferencia").sum()
                         bl_diff_menor_24 = (ship_summary["Rango"] == "Menos de 24 Hrs").sum()
                         bl_diff_mayor_24 = (ship_summary["Rango"] == "Mas de 24 Hrs").sum()
