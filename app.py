@@ -4,7 +4,7 @@ import zipfile
 import io
 
 st.set_page_config(page_title="Reporte BL ETA/ATA (Shipment ID)", layout="centered")
-st.title("Reporte ETA/ATA por Shipment ID / Bill of Lading")
+st.title("Reporte ETA/ATA por Shipment ID")
 
 st.markdown(
     """
@@ -18,8 +18,8 @@ Esta app asume que el CSV tiene SIEMPRE estos nombres de columna:
 
 Lógica principal:
 
-1. **Base de BL (#BL Totales Base)**  
-   - Filas donde `Shipment type = Bill_of_lading` (sin importar mayúsculas/minúsculas).  
+1. **#BL Totales Base**  
+   - Filas donde `Shipment type = Bill_of_lading` (ignorando mayúsculas/minúsculas).
    - Cuenta los `Shipment ID` únicos (columna A).
 
 2. **Filas de contenedores**  
@@ -30,30 +30,30 @@ Lógica principal:
    - Si ATA vacía y `Destination estimated arrival time` (ETA) no vacía → usar ETA.  
    - Si ambas vacías → `ETA/ATA Invalido`.
 
-4. **Sólo filas de contenedores con ETA/ATA válida** (no `ETA/ATA Invalido`):  
-   - Agrupa por **Shipment ID** (columna A).  
-   - Calcula por cada Shipment ID:
+4. **Sólo contenedores con ETA/ATA válida** (no `ETA/ATA Invalido`):  
+   - Agrupa por **Shipment ID**.  
+   - Calcula por Shipment ID:
      - `Min` = mínima ETA/ATA.  
      - `Max` = máxima ETA/ATA.  
-     - `diferencia` = (Max − Min) en horas.  
+     - `diferencia_horas` = (Max − Min) en horas.  
      - `Rango`:
        - `Sin diferencia` → 0 horas  
        - `Menos de 24 Hrs` → 0 < diff ≤ 24  
        - `Mas de 24 Hrs` → diff > 24  
 
-5. **Resumen (tabla_resumen_bls) a nivel Shipment ID**
+5. **Tabla resumen a nivel Shipment ID**
 
    - **#BL Totales Base**  
-     - `Shipment ID` únicos con `Shipment type = Bill_of_lading`.
+     - Shipment ID únicos (base) con fila `Bill_of_lading`.
 
    - **#BL Válidos (universo prueba)**  
-     - Esos mismos `Shipment ID`, pero que tienen al menos un contenedor con ETA/ATA válida **y parseable como fecha/hora**.
+     - Shipment ID de la base que tienen al menos un contenedor con ETA/ATA válida **y parseable**.
 
    - **Diferencia (BL no válidos)**  
      - Base − Válidos.
 
    - **BL con diferencias ETA/ATA**  
-     - BL válidos con `diferencia` > 1 minuto.
+     - BL válidos con `diferencia_horas` > 1 minuto.
 
    - **BL diferencia de menos de 24 horas**  
      - 1 min < diff ≤ 24 h.
@@ -61,11 +61,9 @@ Lógica principal:
    - **BL diferencia de más de 24 horas**  
      - diff > 24 h.
 
-   Los porcentajes son siempre sobre **#BL Válidos (universo prueba)**.
+   Los porcentajes se calculan sobre **#BL Válidos (universo prueba)**.
 """
 )
-
-uploaded_file = st.file_uploader("Sube el CSV de movimientos (export Movement)", type=["csv"])
 
 
 def clasificar_rango(horas):
@@ -79,7 +77,11 @@ def clasificar_rango(horas):
     return "Mas de 24 Hrs"
 
 
-if uploaded_file is not None:
+uploaded_file = st.file_uploader("Sube el CSV de movimientos (export Movement)", type=["csv"])
+
+if uploaded_file is None:
+    st.info("Sube un archivo CSV para comenzar.")
+else:
     try:
         # Leer como texto
         df = pd.read_csv(uploaded_file, dtype=str)
@@ -123,9 +125,8 @@ if uploaded_file is not None:
 
             # ==== 2. #BL Totales Base (Shipment ID, filas Bill_of_lading) ====
             mask_header_bl = stype_upper == "BILL_OF_LADING"
-            header_df = df.loc[mask_header_bl, [col_shipment_id, col_bol]].copy()
+            header_df = df.loc[mask_header_bl, [col_shipment_id]].copy()
             header_df["shipment_id_norm"] = header_df[col_shipment_id].astype(str).str.strip()
-            header_df["bol_norm"] = header_df[col_bol].astype(str).str.strip()
 
             base_shipments = header_df["shipment_id_norm"].unique()
             base_shipments_set = set(base_shipments)
@@ -221,13 +222,13 @@ if uploaded_file is not None:
                             "%Y-%m-%d %H:%M:%S"
                         )
 
-                        # ==== NUEVO: quedarnos sólo con Shipment ID donde min_dt y max_dt son parseables ====
+                        # ==== 7. Quedarnos sólo con Shipment ID donde min_dt y max_dt son parseables ====
                         ship_stats_valid = ship_stats[
                             ship_stats["min_dt"].notna() & ship_stats["max_dt"].notna()
                         ].copy()
 
                         # ---- DataFrame resumen por Shipment ID (para CSV) ----
-                        resumen_por_bl = ship_stats_valid.rename(
+                        resumen_por_shipment = ship_stats_valid.rename(
                             columns={"shipment_id_norm": col_shipment_id}
                         )[
                             [
@@ -240,7 +241,7 @@ if uploaded_file is not None:
                             ]
                         ].copy()
 
-                        # ==== 7. Escribir Min/Max/diferencia/Rango en df detalle (a nivel contenedor) ====
+                        # ==== 8. Escribir Min/Max/diferencia/Rango en df detalle (a nivel contenedor) ====
                         # Merge por shipment_id_norm usando sólo ship_stats_valid
                         valid = valid.merge(
                             ship_stats_valid[
@@ -260,12 +261,12 @@ if uploaded_file is not None:
                         # CSV detalle = solo contenedores con ETA/ATA válida
                         detalle = df.loc[valid.index].copy()
 
-                        # ==== 8. Tabla resumen pedida (a nivel Shipment ID) ====
+                        # ==== 9. Tabla resumen pedida (a nivel Shipment ID) ====
 
-                        # 8.1 BL Totales Base: Shipment ID únicos con Shipment type = Bill_of_lading
+                        # 9.1 BL Totales Base: Shipment ID únicos con Shipment type = Bill_of_lading
                         total_bl_base = len(base_shipments)
 
-                        # 8.2 BL válidos (universo prueba):
+                        # 9.2 BL válidos (universo prueba):
                         # Shipment ID de base que estén en ship_stats_valid
                         ship_valid_ids = ship_stats_valid["shipment_id_norm"].astype(str).unique()
                         ship_valid_ids_set = set(ship_valid_ids)
@@ -273,4 +274,130 @@ if uploaded_file is not None:
                         valid_shipments = list(base_shipments_set & ship_valid_ids_set)
                         total_bl_validos = len(valid_shipments)
 
-                        # 8.3 Diferencia (BL no válidos) = base - válidos
+                        # 9.3 Diferencia (BL no válidos) = base - válidos
+                        total_bl_no_validos = total_bl_base - total_bl_validos
+
+                        # 9.4 Diferencias por Shipment ID (usando diferencia_horas, sólo parseables y válidos)
+                        ship_diff = ship_stats_valid[
+                            ship_stats_valid["shipment_id_norm"].isin(valid_shipments)
+                        ].copy()
+
+                        # Umbral de 1 minuto en horas
+                        one_minute_hours = 1.0 / 60.0
+
+                        bl_con_diferencias = (
+                            ship_diff["diferencia_horas"] > one_minute_hours
+                        ).sum()
+
+                        bl_diff_menor_24 = (
+                            (ship_diff["diferencia_horas"] > one_minute_hours)
+                            & (ship_diff["diferencia_horas"] <= 24)
+                        ).sum()
+
+                        bl_diff_mayor_24 = (
+                            ship_diff["diferencia_horas"] > 24
+                        ).sum()
+
+                        # Construir tabla_resumen_bls
+                        rows = []
+
+                        def pct_valid(count):
+                            if total_bl_validos == 0:
+                                return None
+                            return round((count / total_bl_validos) * 100, 2)
+
+                        # #BL Totales Base
+                        rows.append(
+                            {
+                                "indicador": "#BL Totales Base (Shipment ID, Shipment type = Bill_of_lading)",
+                                "cantidad": int(total_bl_base),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # #BL Válidos (universo prueba)
+                        rows.append(
+                            {
+                                "indicador": "#BL Válidos (universo prueba, con ETA/ATA válida y parseable)",
+                                "cantidad": int(total_bl_validos),
+                                "porcentaje_sobre_validos": pct_valid(total_bl_validos),
+                            }
+                        )
+
+                        # Diferencia (BL no válidos)
+                        rows.append(
+                            {
+                                "indicador": "Diferencia (BL no válidos)",
+                                "cantidad": int(total_bl_no_validos),
+                                "porcentaje_sobre_validos": "",
+                            }
+                        )
+
+                        # BL con diferencias ETA/ATA (> 1 minuto)
+                        rows.append(
+                            {
+                                "indicador": "BL con diferencias ETA/ATA (> 1 minuto)",
+                                "cantidad": int(bl_con_diferencias),
+                                "porcentaje_sobre_validos": pct_valid(bl_con_diferencias),
+                            }
+                        )
+
+                        # BL diferencia de menos de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de menos de 24 horas (1 min < diff ≤ 24 h)",
+                                "cantidad": int(bl_diff_menor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_menor_24),
+                            }
+                        )
+
+                        # BL diferencia de más de 24 horas
+                        rows.append(
+                            {
+                                "indicador": "BL diferencia de más de 24 horas (diff > 24 h)",
+                                "cantidad": int(bl_diff_mayor_24),
+                                "porcentaje_sobre_validos": pct_valid(bl_diff_mayor_24),
+                            }
+                        )
+
+                        tabla_resumen = pd.DataFrame(
+                            rows,
+                            columns=["indicador", "cantidad", "porcentaje_sobre_validos"],
+                        )
+
+                        # ==== 10. Construir ZIP con los 3 CSV ====
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(
+                            zip_buffer, "w", compression=zipfile.ZIP_DEFLATED
+                        ) as zf:
+                            zf.writestr(
+                                "detalle_eta_ata_por_contenedor.csv",
+                                detalle.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                            zf.writestr(
+                                "resumen_por_shipment_id.csv",
+                                resumen_por_shipment.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                            zf.writestr(
+                                "tabla_resumen_bls.csv",
+                                tabla_resumen.to_csv(index=False).encode("utf-8-sig"),
+                            )
+
+                        zip_buffer.seek(0)
+
+                        st.success("Análisis completado. Puedes descargar el ZIP con los tres CSV.")
+                        st.download_button(
+                            label="Descargar ZIP (detalle + resumen por Shipment ID + tabla resumen)",
+                            data=zip_buffer,
+                            file_name="reporte_bl_eta_ata_shipmentid.zip",
+                            mime="application/zip",
+                        )
+
+                        st.subheader("Tabla resumen (vista rápida)")
+                        st.dataframe(tabla_resumen)
+
+                        st.subheader("Resumen por Shipment ID (vista rápida)")
+                        st.dataframe(resumen_por_shipment.head(50))
+
+    except Exception as e:
+        st.error(f"Error procesando el archivo: {e}")
