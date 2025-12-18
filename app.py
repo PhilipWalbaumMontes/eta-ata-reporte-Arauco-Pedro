@@ -8,37 +8,39 @@ st.title("Reporte ETA/ATA por Bill of Lading")
 
 st.markdown(
     """
-Esta app:
+Esta app asume que el CSV tiene SIEMPRE estos nombres de columna:
 
-1. Usa columnas fijas:
-   - A = `Shipment ID`
-   - B = `Shipment type`
-   - C = `Bill of lading`
-   - AJ = `Destination estimated arrival time` (ETA)
-   - AK = `Destination actual arrival time` (ATA)
+- `Shipment ID`
+- `Shipment type`
+- `Bill of lading`
+- `Destination estimated arrival time`  (ETA destino)
+- `Destination actual arrival time`    (ATA destino)
 
-2. Considera filas de **contenedores** (`Shipment type = CONTAINER / CONTAINER_ID`).
+Lógica:
 
-3. Construye la columna **ETA/ATA**:
-   - Si AK tiene valor (no vacío) → usa AK.
-   - Si no, pero AJ tiene valor → usa AJ.
-   - Si ninguna tiene valor → `BL Invalido`.
+1. Considera solo filas de **contenedores**:
+   - `Shipment type` = `CONTAINER` o `CONTAINER_ID` (sin importar mayúsculas/minúsculas).
 
-4. Solo con filas donde `ETA/ATA` tiene valor (no `BL Invalido`):
-   - Agrupa por **Bill of lading** (columna C).
-   - Calcula:
-     - `Min` = fecha/hora mínima ETA/ATA.
-     - `Max` = fecha/hora máxima ETA/ATA.
+2. Construye la columna **ETA/ATA** por fila de contenedor:
+   - Si `Destination actual arrival time` (ATA) no está vacía → usa ATA.
+   - Si ATA está vacía pero `Destination estimated arrival time` (ETA) no está vacía → usa ETA.
+   - Si ambas están vacías → `BL Invalido`.
+
+3. Solo con filas donde `ETA/ATA` NO es `BL Invalido`:
+   - Agrupa por **`Bill of lading`**.
+   - Calcula por cada BL:
+     - `Min` = fecha/hora mínima de ETA/ATA.
+     - `Max` = fecha/hora máxima de ETA/ATA.
      - `diferencia` = (Max - Min) en horas.
      - `Rango`:
        - `Sin diferencia` → 0 horas
        - `Menos de 24 Hrs` → 0 < diff ≤ 24
        - `Mas de 24 Hrs` → diff > 24
 
-5. Genera un ZIP con:
-   - `detalle_eta_ata_por_contenedor.csv`
-   - `resumen_por_bl.csv`
-   - `tabla_resumen_bls.csv` (tabla resumen en número de BL y % sobre BL válidos, usando columna C).
+4. Genera un ZIP con 3 CSV:
+   - `detalle_eta_ata_por_contenedor.csv`  (todas las filas válidas de contenedor)
+   - `resumen_por_bl.csv`                  (una fila por Bill of lading)
+   - `tabla_resumen_bls.csv`               (resumen en número de BL y % sobre BL válidos)
 """
 )
 
@@ -63,31 +65,36 @@ if uploaded_file is not None:
 
         st.write(f"Archivo cargado con **{df.shape[0]} filas** y **{df.shape[1]} columnas**.")
 
-        # === MAPEO FIJO POR POSICIÓN ===
-        # A: Shipment ID  (0)
-        # B: Shipment type (1)
-        # C: Bill of lading (2)
-        # AJ: Destination estimated arrival time (35)
-        # AK: Destination actual arrival time (36)
+        # === VERIFICAR QUE EXISTEN LAS COLUMNAS ESPERADAS POR NOMBRE ===
+        required_cols = [
+            "Shipment ID",
+            "Shipment type",
+            "Bill of lading",
+            "Destination estimated arrival time",
+            "Destination actual arrival time",
+        ]
 
-        if df.shape[1] <= 36:
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
             st.error(
-                "El archivo debe tener al menos 37 columnas para que existan A, B, C, AJ y AK "
-                "(Shipment ID, Shipment type, Bill of lading, ETA, ATA)."
+                "No se encontraron todas las columnas esperadas.\n"
+                f"Faltan: {missing}\n\n"
+                "Columnas disponibles en el archivo:"
             )
+            st.write(list(df.columns))
         else:
-            col_shipment_id = df.columns[0]
-            col_shipment_type = df.columns[1]
-            col_bol = df.columns[2]
-            col_eta = df.columns[35]
-            col_ata = df.columns[36]
+            col_shipment_id = "Shipment ID"
+            col_shipment_type = "Shipment type"
+            col_bol = "Bill of lading"
+            col_eta = "Destination estimated arrival time"
+            col_ata = "Destination actual arrival time"
 
-            st.write("Columnas detectadas (por posición):")
-            st.write(f"- Shipment ID (A): **{col_shipment_id}**")
-            st.write(f"- Shipment type (B): **{col_shipment_type}**")
-            st.write(f"- Bill of lading (C): **{col_bol}**")
-            st.write(f"- ETA destino (AJ): **{col_eta}**")
-            st.write(f"- ATA destino (AK): **{col_ata}**")
+            st.write("Columnas detectadas correctamente por nombre.")
+            st.write(f"- Shipment ID: **{col_shipment_id}**")
+            st.write(f"- Shipment type: **{col_shipment_type}**")
+            st.write(f"- Bill of lading: **{col_bol}**")
+            st.write(f"- ETA destino: **{col_eta}**")
+            st.write(f"- ATA destino: **{col_ata}**")
 
             # === FILAS DE CONTENEDORES ===
             mask_containers = df[col_shipment_type].str.strip().str.upper().isin(
@@ -108,9 +115,9 @@ if uploaded_file is not None:
                 all_bls_set = set(all_bls_series.unique())
                 total_bls_totales = len(all_bls_set)
 
-                st.subheader("Resumen de Bill of Lading (por columna C en contenedores)")
+                st.subheader("Resumen inicial por Bill of lading (columna C)")
                 st.metric(
-                    label="BL totales (columna C, contenedores)",
+                    label="BL totales (Bill of lading distintos en filas de contenedores)",
                     value=int(total_bls_totales),
                 )
 
@@ -120,16 +127,15 @@ if uploaded_file is not None:
 
                 # ETA/ATA string: prioriza ATA; si no, ETA; si ambas vacías → vacío
                 containers["etaata_str"] = containers["ata_str"]
-                containers.loc[
-                    containers["etaata_str"] == "", "etaata_str"
-                ] = containers.loc[
-                    containers["etaata_str"] == "", "eta_str"
+                mask_empty_etaata = containers["etaata_str"] == ""
+                containers.loc[mask_empty_etaata, "etaata_str"] = containers.loc[
+                    mask_empty_etaata, "eta_str"
                 ]
 
-                # Inicializar en df completo
+                # Inicializar en df completo como BL Invalido
                 df["ETA/ATA"] = "BL Invalido"
 
-                # Filas de contenedores con ETA/ATA NO vacía (válidos según tu definición)
+                # Filas de contenedores con ETA/ATA NO vacía (válidos según definición)
                 mask_valid_etaata_str = (
                     containers["etaata_str"].notna()
                     & (containers["etaata_str"].str.strip() != "")
@@ -144,7 +150,7 @@ if uploaded_file is not None:
                 if containers_valid.empty:
                     st.warning("No hay contenedores con ETA/ATA no vacía (todos BL Invalido).")
                 else:
-                    # Escribir ETA/ATA en df original
+                    # Escribir ETA/ATA en df original en las mismas filas
                     df.loc[containers_valid.index, "ETA/ATA"] = containers_valid["etaata_str"]
 
                     # === PASO 3: Min y Max por BoL (C) sólo para filas con ETA/ATA válida ===
@@ -156,9 +162,10 @@ if uploaded_file is not None:
                             "No hay filas de contenedores con ETA/ATA válida después del filtrado."
                         )
                     else:
-                        # Parsear la columna ETA/ATA a datetime para poder calcular min/max/diferencia
+                        # Parsear la columna ETA/ATA a datetime para min/max/diferencia
+                        # No forzamos utc ni nada raro; dejamos que pandas lo interprete.
                         valid["etaata_dt"] = pd.to_datetime(
-                            valid["ETA/ATA"], errors="coerce", utc=True
+                            valid["ETA/ATA"], errors="coerce"
                         )
 
                         group = valid.groupby(col_bol, dropna=False)
@@ -206,7 +213,7 @@ if uploaded_file is not None:
 
                         # === TABLA RESUMEN (USANDO BILL OF LADING COMO UNIDAD) ===
 
-                        # BL válidos = BoL que aparecen en el resumen (tienen al menos un contenedor con ETA/ATA no vacía)
+                        # BL válidos = BoL que aparecen en el resumen
                         valid_bls_series = resumen[col_bol].astype(str)
                         valid_bls_set = set(valid_bls_series.unique())
                         total_bls_validos = len(valid_bls_set)
@@ -230,7 +237,7 @@ if uploaded_file is not None:
                         # 1) Bill of Lading Totales
                         rows.append(
                             {
-                                "indicador": "Bill of Lading Totales",
+                                "indicador": "Bill of Lading Totales (columna C en contenedores)",
                                 "cantidad": int(total_bls_totales),
                                 "porcentaje_sobre_validos": "",
                             }
@@ -239,7 +246,7 @@ if uploaded_file is not None:
                         # 2) Bill of Lading Totales Válidos
                         rows.append(
                             {
-                                "indicador": "Bill of Lading Totales Válidos (con ETA/ATA no vacía)",
+                                "indicador": "Bill of Lading Totales Válidos (al menos 1 ETA/ATA válida)",
                                 "cantidad": int(total_bls_validos),
                                 "porcentaje_sobre_validos": pct_valid(total_bls_validos),
                             }
