@@ -17,7 +17,7 @@ Esta app hace:
 4. Para los BL **no inválidos**:
    - Toma filas donde `Shipment type` (B) es `Container_id` / `CONTAINER_ID` / `CONTAINER`.
    - Agrupa por columna **C** (Container_ID).
-   - Calcula fecha/hora **mínima** y **máxima** en **AL** para cada Container_ID.
+   - Calcula fecha/hora **mínima** y **máxima** en **AM** para cada Container_ID.
    - Escribe:
      - Min en **AO**
      - Max en **AP**
@@ -96,7 +96,6 @@ if uploaded_file is not None:
                     "No encontré filas donde la columna B tenga 'Bill_of_lading' "
                     "(revisado sin sensibilidad a mayúsculas)."
                 )
-                # En este caso igual armamos ZIP con archivos vacíos
                 resumen_base = pd.DataFrame(
                     [
                         {
@@ -168,7 +167,6 @@ if uploaded_file is not None:
                     pct_invalid = ""
                     pct_valid = ""
 
-                # DataFrames para el ZIP
                 resumen_base = pd.DataFrame(
                     [
                         {
@@ -197,7 +195,7 @@ if uploaded_file is not None:
                 st.dataframe(df_invalid_list)
 
                 # ============================================
-                # PARTE 2: Cálculo para BL válidos en C/AL→AN
+                # PARTE 2: Cálculo para BL válidos en C/AM→AN
                 # ============================================
 
                 # Filas de contenedores: Shipment type = Container_id / CONTAINER_ID / CONTAINER
@@ -227,7 +225,7 @@ if uploaded_file is not None:
                     if containers_valid_bl.empty:
                         st.warning(
                             "No hay filas de contenedores asociadas a Shipment ID válidos "
-                            "(sin AM = BL Invalido)."
+                            "(sin AM = BL Invalido en la cabecera)."
                         )
                         container_report = pd.DataFrame(
                             columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
@@ -238,20 +236,26 @@ if uploaded_file is not None:
                             f"{len(containers_valid_bl)}"
                         )
 
-                        # Parsear AL a datetime
-                        containers_valid_bl["AL_dt"] = pd.to_datetime(
-                            containers_valid_bl[col_AL], errors="coerce"
+                        # 👉 PASO CLAVE: usar SIEMPRE la columna C (container_id_norm)
+                        # para agrupar todos los registros que tengan el mismo Container_ID
+                        # y calcular min/max de la fecha AM entre ellos.
+
+                        # Parsear AM a datetime
+                        containers_valid_bl["AM_dt"] = pd.to_datetime(
+                            containers_valid_bl[col_AM], errors="coerce"
                         )
 
-                        # Agrupar por Container_ID (columna C) y calcular min/max
+                        # Agrupar explícitamente por columna C (container_id_norm)
                         group_cont = containers_valid_bl.groupby(
                             "container_id_norm", dropna=False
                         )
-                        min_dt = group_cont["AL_dt"].transform("min")
-                        max_dt = group_cont["AL_dt"].transform("max")
 
-                        containers_valid_bl["min_dt"] = min_dt
-                        containers_valid_bl["max_dt"] = max_dt
+                        # Para cada grupo de Container_ID (mismo valor en C), calcular min y max de AM
+                        min_dt_by_container = group_cont["AM_dt"].transform("min")
+                        max_dt_by_container = group_cont["AM_dt"].transform("max")
+
+                        containers_valid_bl["min_dt"] = min_dt_by_container
+                        containers_valid_bl["max_dt"] = max_dt_by_container
 
                         # Diferencia en horas (max - min)
                         diff_td = containers_valid_bl["max_dt"] - containers_valid_bl["min_dt"]
@@ -289,14 +293,14 @@ if uploaded_file is not None:
                         ]
                         container_report = df.loc[containers_valid_bl.index, cols_report].copy()
 
-                        st.subheader("Muestra del reporte de contenedores (con diferencias en AL)")
+                        st.subheader("Muestra del reporte de contenedores (con diferencias en AM)")
                         st.dataframe(container_report.head(50))
 
             # ============================
             # PARTE 3: Construir ZIP final
             # ============================
 
-            # Asegurar que container_report tenga las columnas correctas aunque esté vacío
+            # Asegurar que container_report exista y tenga las columnas correctas
             if 'container_report' not in locals() or container_report is None:
                 container_report = pd.DataFrame(
                     columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
@@ -312,7 +316,6 @@ if uploaded_file is not None:
                     "bl_invalidos_lista.csv",
                     df_invalid_list.to_csv(index=False).encode("utf-8-sig"),
                 )
-                # Siempre escribimos el CSV de contenedores, aunque esté vacío
                 zf.writestr(
                     "container_diferencias_horas.csv",
                     container_report.to_csv(index=False).encode("utf-8-sig"),
