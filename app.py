@@ -12,7 +12,7 @@ Esta app hace:
 
 1. Pide que subas un CSV.
 2. Cuenta la cantidad de **Shipment ID únicos (columna A)** donde `Shipment type` (columna B) = `Bill_of_lading`
-   (sin sensibilidad a mayúsculas).
+   (sin sensibilidad a mayúsculas/minúsculas).
 3. Dentro de esos BL base, cuenta cuántos tienen en la **columna AM** el valor `BL Invalido`.
 4. Para los BL **no inválidos**:
    - Toma filas donde `Shipment type` (B) es `Container_id` / `CONTAINER_ID` / `CONTAINER`.
@@ -30,7 +30,6 @@ Esta app hace:
 )
 
 uploaded_file = st.file_uploader("Sube el CSV", type=["csv"])
-
 
 if uploaded_file is not None:
     try:
@@ -97,6 +96,32 @@ if uploaded_file is not None:
                     "No encontré filas donde la columna B tenga 'Bill_of_lading' "
                     "(revisado sin sensibilidad a mayúsculas)."
                 )
+                # En este caso igual armamos ZIP con archivos vacíos
+                resumen_base = pd.DataFrame(
+                    [
+                        {
+                            "indicador": "#BL Totales Base (Shipment ID, Shipment type = Bill_of_lading)",
+                            "cantidad": 0,
+                            "porcentaje": "",
+                        },
+                        {
+                            "indicador": "#BL con AM = 'BL Invalido' (dentro de la base)",
+                            "cantidad": 0,
+                            "porcentaje": "",
+                        },
+                        {
+                            "indicador": "#BL Válidos (base - inválidos)",
+                            "cantidad": 0,
+                            "porcentaje": "",
+                        },
+                    ]
+                )
+                df_invalid_list = pd.DataFrame(
+                    {"Shipment ID inválidos (AM = BL Invalido)": []}
+                )
+                container_report = pd.DataFrame(
+                    columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
+                )
             else:
                 # Normalizar Shipment ID
                 header_df["shipment_id_norm"] = header_df[col_A].astype(str).str.strip()
@@ -119,7 +144,7 @@ if uploaded_file is not None:
                 valid_shipments_set = base_shipments_set - invalid_shipments_set
                 total_bl_valid = len(valid_shipments_set)
 
-                # Métricas
+                # Métricas en pantalla
                 st.subheader("Resultados del análisis de BL base")
                 st.metric(
                     label="#BL Totales Base (Shipment ID únicos con Shipment type = Bill_of_lading)",
@@ -140,8 +165,8 @@ if uploaded_file is not None:
                     pct_invalid = round(total_bl_invalid / total_bl_base * 100, 2)
                     pct_valid = round(total_bl_valid / total_bl_base * 100, 2)
                 else:
-                    pct_invalid = None
-                    pct_valid = None
+                    pct_invalid = ""
+                    pct_valid = ""
 
                 # DataFrames para el ZIP
                 resumen_base = pd.DataFrame(
@@ -184,7 +209,9 @@ if uploaded_file is not None:
                         "No se encontraron filas de contenedores (CONTAINER/CONTAINER_ID) "
                         f"en la columna '{col_B}'."
                     )
-                    container_report = pd.DataFrame()
+                    container_report = pd.DataFrame(
+                        columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
+                    )
                 else:
                     st.info(f"Se detectaron {len(containers)} filas de contenedores en total.")
 
@@ -202,7 +229,9 @@ if uploaded_file is not None:
                             "No hay filas de contenedores asociadas a Shipment ID válidos "
                             "(sin AM = BL Invalido)."
                         )
-                        container_report = pd.DataFrame()
+                        container_report = pd.DataFrame(
+                            columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
+                        )
                     else:
                         st.info(
                             f"Filas de contenedores asociadas a BL válidos: "
@@ -263,35 +292,41 @@ if uploaded_file is not None:
                         st.subheader("Muestra del reporte de contenedores (con diferencias en AL)")
                         st.dataframe(container_report.head(50))
 
-                # ============================
-                # PARTE 3: Construir ZIP final
-                # ============================
+            # ============================
+            # PARTE 3: Construir ZIP final
+            # ============================
 
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr(
-                        "bl_resumen_base_invalidos.csv",
-                        resumen_base.to_csv(index=False).encode("utf-8-sig"),
-                    )
-                    zf.writestr(
-                        "bl_invalidos_lista.csv",
-                        df_invalid_list.to_csv(index=False).encode("utf-8-sig"),
-                    )
-                    if not container_report.empty:
-                        zf.writestr(
-                            "container_diferencias_horas.csv",
-                            container_report.to_csv(index=False).encode("utf-8-sig"),
-                        )
-
-                zip_buffer.seek(0)
-
-                st.success("Análisis completado. Puedes descargar el ZIP con los reportes.")
-                st.download_button(
-                    label="Descargar ZIP (resumen BL + inválidos + contenedores)",
-                    data=zip_buffer,
-                    file_name="reporte_bl_invalidos_y_contenedores.zip",
-                    mime="application/zip",
+            # Asegurar que container_report tenga las columnas correctas aunque esté vacío
+            if 'container_report' not in locals() or container_report is None:
+                container_report = pd.DataFrame(
+                    columns=[col_A, col_B, col_C, col_AJ, col_AK, col_AL, col_AM, col_AN, col_AO, col_AP]
                 )
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(
+                    "bl_resumen_base_invalidos.csv",
+                    resumen_base.to_csv(index=False).encode("utf-8-sig"),
+                )
+                zf.writestr(
+                    "bl_invalidos_lista.csv",
+                    df_invalid_list.to_csv(index=False).encode("utf-8-sig"),
+                )
+                # Siempre escribimos el CSV de contenedores, aunque esté vacío
+                zf.writestr(
+                    "container_diferencias_horas.csv",
+                    container_report.to_csv(index=False).encode("utf-8-sig"),
+                )
+
+            zip_buffer.seek(0)
+
+            st.success("Análisis completado. Puedes descargar el ZIP con los reportes.")
+            st.download_button(
+                label="Descargar ZIP (resumen BL + inválidos + contenedores)",
+                data=zip_buffer,
+                file_name="reporte_bl_invalidos_y_contenedores.zip",
+                mime="application/zip",
+            )
 
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
