@@ -1,16 +1,16 @@
-import csv
-from pathlib import Path
+# app.py
 import pandas as pd
+import streamlit as st
+from io import BytesIO
 
+# Columnas por posición (0-based):
+# A=0 B=1 C=2 ... G=6 H=7 ... N=13
+IDX_BOL = 2
+IDX_ESTIMATED = 6
+IDX_ACTUAL = 7
+IDX_PRIORITIZED = 13  # N
 
-def detect_delimiter(path: str, sample_bytes: int = 65536) -> str:
-    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-        sample = f.read(sample_bytes)
-    try:
-        dialect = csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"])
-        return dialect.delimiter
-    except Exception:
-        return ","
+EXPECTED_MIN_COLS = 14  # A..N
 
 
 def is_blank(x) -> bool:
@@ -22,76 +22,125 @@ def is_blank(x) -> bool:
     return str(x).strip() == ""
 
 
-def ensure_cols(df: pd.DataFrame, total_cols: int = 14) -> pd.DataFrame:
-    """Asegura columnas hasta N (A..N = 14 columnas). Si faltan, agrega vacías."""
+def ensure_min_columns(df: pd.DataFrame, min_cols: int = EXPECTED_MIN_COLS) -> pd.DataFrame:
+    """Asegura al menos A..N; si faltan columnas, las agrega vacías al final."""
     df = df.copy()
-    missing = total_cols - df.shape[1]
+    missing = min_cols - df.shape[1]
     if missing > 0:
         for i in range(missing):
             df[f"__extra_{i+1}__"] = ""
     return df
 
 
-def generar_reportes(input_csv: str, output_dir: str) -> tuple[str, str]:
+def count_unique_bol_excluding_blanks(series: pd.Series) -> int:
+    """Cuenta únicos en C excluyendo NULL/blancos/solo espacios (y normalizando con strip)."""
+    cleaned = []
+    for v in series.tolist():
+        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s == "":
+            continue
+        cleaned.append(s)
+    return int(pd.Series(cleaned).nunique(dropna=True))
+
+
+def apply_prioritized_value(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Devuelve rutas de:
-    - Tabla Resumen.csv
-    - Archivo completo.csv
+    Columna N:
+    - Si H tiene valor -> N = H
+    - Si no, si G tiene valor -> N = G
+    - Si no -> "No Valido"
+    (whitespace-only cuenta como blanco)
     """
-    delim = detect_delimiter(input_csv)
+    df = df.copy()
+    g = df.iloc[:, IDX_ESTIMATED]
+    h = df.iloc[:, IDX_ACTUAL]
 
-    df = pd.read_csv(
-        input_csv,
-        delimiter=delim,
-        dtype=str,
-        keep_default_na=True
-    )
-
-    # Asegurar A..N
-    df = ensure_cols(df, total_cols=14)
-
-    # Índices 0-based:
-    # A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 ... N=13
-    col_C = df.iloc[:, 2]  # Bill of lading
-    col_G = df.iloc[:, 6]  # Destination estimated arrival time
-    col_H = df.iloc[:, 7]  # Destination actual arrival time
-
-    # (1) Conteo de únicos en C excluyendo blancos/NULL/solo espacios
-    c_clean = col_C.astype(object).where(~col_C.isna(), None)
-    c_stripped = c_clean.apply(lambda v: None if v is None else str(v).strip())
-    c_nonblank = c_stripped.dropna()
-    c_nonblank = c_nonblank[c_nonblank != ""]
-    unique_bol_count = int(c_nonblank.nunique(dropna=True))
-
-    # (2) Columna N: Valor priorizado
-    n_values = []
-    for h, g in zip(col_H.tolist(), col_G.tolist()):
-        if not is_blank(h):
-            n_values.append(str(h))
-        elif not is_blank(g):
-            n_values.append(str(g))
+    prioritized = []
+    for hv, gv in zip(h.tolist(), g.tolist()):
+        if not is_blank(hv):
+            prioritized.append(str(hv).strip())
+        elif not is_blank(gv):
+            prioritized.append(str(gv).strip())
         else:
-            n_values.append("No Valido")
+            prioritized.append("No Valido")
 
-    df.iloc[:, 13] = n_values  # N
-
-    # Salidas
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    tabla_resumen_path = str(out_dir / "Tabla Resumen.csv")
-    archivo_completo_path = str(out_dir / "Archivo completo.csv")
-
-    tabla_resumen = pd.DataFrame([{
-        "indicador": "Cantidad de Bill of lading únicos (columna C) sin blancos",
-        "valor": unique_bol_count
-    }])
-    tabla_resumen.to_csv(tabla_resumen_path, index=False)
-
-    df.to_csv(archivo_completo_path, index=False, sep=delim)
-
-    return tabla_resumen_path, archivo_completo_path
+    df.iloc[:, IDX_PRIORITIZED] = prioritized
+    return df
 
 
-# Ejemplo de uso:
-# generar_reportes("input.csv", "./salida")
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
+
+
+st.set_page_config(page_title="Reporte - Tabla Resumen + Archivo completo", layout="wide")
+st.title("Reporte: Tabla Resumen + Archivo completo")
+
+st.write(
+    """
+**Reglas:**
+- Columna **C**: contar valores únicos **excluyendo** blancos/NULL/solo espacios.
+- Columna **N (Valor priorizado)**:
+  - Si **H** tiene valor → N = H
+  - Si no, si **G** tiene valor → N = G
+  - Si no → **No Valido**
+- Valores con **solo espacios** se consideran **en blanco**.
+"""
+)
+
+uploaded = st.file_uploader("Sube tu archivo Excel", type=["xlsx", "xls"])
+
+if uploaded:
+    try:
+        xls = pd.ExcelFile(uploaded)
+        sheet = st.selectbox("Selecciona la hoja a procesar", xls.sheet_names, index=0)
+
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str, keep_default_na=True)
+        df = ensure_min_columns(df, EXPECTED_MIN_COLS)
+
+        if df.shape[1] < EXPECTED_MIN_COLS:
+            st.error("El archivo no tiene suficientes columnas para llegar hasta la columna N (A..N).")
+            st.stop()
+
+        if st.button("Procesar"):
+            unique_bols = count_unique_bol_excluding_blanks(df.iloc[:, IDX_BOL])
+            df_out = apply_prioritized_value(df)
+
+            # Tabla Resumen (archivo 1)
+            resumen = pd.DataFrame([{
+                "indicador": "Cantidad de valores únicos en columna C (Bill of lading) sin blancos",
+                "valor": unique_bols
+            }])
+
+            st.success("Procesamiento listo.")
+            st.metric("BOL únicos (C) sin blancos", unique_bols)
+
+            # Bytes para descarga
+            resumen_bytes = df_to_xlsx_bytes(resumen, "Tabla Resumen")
+            completo_bytes = df_to_xlsx_bytes(df_out, "Archivo completo")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "Descargar Tabla Resumen.xlsx",
+                    data=resumen_bytes,
+                    file_name="Tabla Resumen.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with col2:
+                st.download_button(
+                    "Descargar Archivo completo.xlsx",
+                    data=completo_bytes,
+                    file_name="Archivo completo.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            with st.expander("Vista previa (primeras 20 filas)"):
+                st.dataframe(df_out.head(20), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error leyendo o procesando el archivo: {e}")
