@@ -14,6 +14,7 @@ IDX_C_BOL = 2
 IDX_G_ESTIMATED = 6
 IDX_H_ACTUAL = 7
 
+IDX_J_VALID_VOL = 9
 IDX_K_MIN = 10
 IDX_L_MAX = 11
 IDX_N_PRIORITIZED = 13
@@ -130,17 +131,21 @@ def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def parse_dates(series: pd.Series, mode: str) -> pd.Series:
+def parse_dates(series: pd.Series, mode: str, dayfirst: bool | None = None) -> pd.Series:
     """
     mode:
-      - "AUTO": elige entre MDY/DMY por mayor cantidad de parseos exitosos
       - "MDY": month/day/year (dayfirst=False)
       - "DMY": day/month/year (dayfirst=True)
+      - "AUTO": usa dayfirst según `dayfirst` (si se entrega) o decide por cantidad de parseos
     """
     if mode == "MDY":
         return pd.to_datetime(series, errors="coerce", dayfirst=False)
     if mode == "DMY":
         return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+    # AUTO
+    if dayfirst is not None:
+        return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
 
     dt_mdy = pd.to_datetime(series, errors="coerce", dayfirst=False)
     dt_dmy = pd.to_datetime(series, errors="coerce", dayfirst=True)
@@ -214,11 +219,7 @@ def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) 
 
 
 def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
-    """
-    NUEVO PASO:
-    Rellena K/L SOLO en filas BILL_OF_LADING usando el min/max calculado desde contenedores
-    (agrupado por col C).
-    """
+    """Rellena K/L SOLO en filas BILL_OF_LADING usando el min/max calculado desde contenedores."""
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -233,6 +234,53 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
 
     df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
     df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
+    return df
+
+
+def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+    """
+    Columna J (VALID VOL):
+    - Calcula diferencia en horas entre L y K: (L - K) en horas
+    - Si K/L no es fecha válida o es "No Valido" => J = "No Valido"
+    """
+    df = df.copy()
+
+    k_raw = df.iloc[:, IDX_K_MIN]
+    l_raw = df.iloc[:, IDX_L_MAX]
+
+    k_clean = k_raw.apply(
+        lambda v: None
+        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
+        else str(v).strip()
+    )
+    l_clean = l_raw.apply(
+        lambda v: None
+        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
+        else str(v).strip()
+    )
+
+    # Para AUTO: decidir dayfirst usando K y L juntos
+    dayfirst = None
+    if date_mode == "AUTO":
+        combined = pd.concat([k_clean, l_clean], ignore_index=True)
+        dt_mdy = pd.to_datetime(combined, errors="coerce", dayfirst=False)
+        dt_dmy = pd.to_datetime(combined, errors="coerce", dayfirst=True)
+        dayfirst = dt_dmy.notna().sum() > dt_mdy.notna().sum()
+
+    k_dt = parse_dates(k_clean, mode=date_mode, dayfirst=dayfirst)
+    l_dt = parse_dates(l_clean, mode=date_mode, dayfirst=dayfirst)
+
+    diff_hours = (l_dt - k_dt) / pd.Timedelta(hours=1)
+
+    def fmt_hours(x):
+        if pd.isna(x):
+            return "No Valido"
+        # Si es casi entero, dejar entero
+        if abs(x - round(float(x))) < 1e-9:
+            return str(int(round(float(x))))
+        return f"{float(x):.2f}"
+
+    df.iloc[:, IDX_J_VALID_VOL] = diff_hours.apply(fmt_hours)
     return df
 
 
@@ -284,10 +332,11 @@ st.title("Reporte CSV: Tabla Resumen + Archivo completo")
 st.markdown(
     """
 **Reglas actuales:**
-1) N = H si existe, si no G, si no `No Valido`  
+1) **N (Valor priorizado)** = H si existe, si no G, si no `No Valido`  
 2) Min/Max desde contenedores (B contiene CONTAINER), agrupando por C y usando N  
    - K/L en filas Container  
-3) **Nuevo paso:** aplicar ese Min/Max también a filas BILL_OF_LADING (B contiene BILL_OF_LADING) usando su C
+3) Aplicar ese Min/Max a filas BILL_OF_LADING  
+4) **J (VALID VOL)** = diferencia en horas entre **L y K** (si no se puede calcular: `No Valido`)
 """
 )
 
@@ -300,7 +349,7 @@ if uploaded:
     sep = st.selectbox("Delimitador", options=[detected, ",", ";", "\t", "|"], index=0)
 
     date_mode = st.selectbox(
-        "Formato de fecha para calcular Min/Max (columna N)",
+        "Formato de fecha para cálculos (N/K/L)",
         options=["AUTO", "MDY", "DMY"],
         index=0,
         help="AUTO elige el que parsea más valores. MDY = mes/día/año. DMY = día/mes/año.",
@@ -328,10 +377,13 @@ if uploaded:
             # 2a) Aplicar a filas Container
             df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
 
-            # 3) Aplicar a filas BILL_OF_LADING (nuevo paso)
+            # 3) Aplicar a filas BILL_OF_LADING
             df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map)
 
-            # Resumen (se mantiene tal como lo venías usando)
+            # 4) Calcular J = horas entre K y L
+            df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
+
+            # Resumen (se mantiene)
             bol_unique_ids = unique_ids_where_type_contains_bill_of_lading(df_out)
             bol_inactive_ids = unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df_out)
 
