@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 # Índices 0-based por letra:
-# A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10 L=11 M=12 N=13
+# A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10 L=11 M=12 N=13 O=14
 IDX_A_SHIPMENT_ID = 0
 IDX_B_SHIPMENT_TYPE = 1
 IDX_C_BOL = 2
@@ -14,12 +14,13 @@ IDX_C_BOL = 2
 IDX_G_ESTIMATED = 6
 IDX_H_ACTUAL = 7
 
-IDX_J_VALID_VOL = 9
-IDX_K_MIN = 10
-IDX_L_MAX = 11
-IDX_N_PRIORITIZED = 13
+IDX_J_DIFF_HOURS = 9          # J = DIFERENCIA (horas)
+IDX_K_MIN = 10                # K = Min (fecha)
+IDX_L_MAX = 11                # L = Max (fecha)
+IDX_N_PRIORITIZED = 13        # N = Valor priorizado (fecha)
+IDX_O_RANGE = 14              # O = RANGO DIFERENCIA
 
-MIN_COLS_A_TO_N = 14  # A..N
+MIN_COLS_A_TO_O = 15  # A..O
 
 
 def sniff_delimiter(text: str) -> str:
@@ -78,14 +79,15 @@ def clean_bol_key(x) -> str:
 
 def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     """
-    Asegura al menos A..N (14 columnas). Si faltan, agrega columnas vacías al final.
+    Asegura al menos A..O (15 columnas). Si faltan, agrega columnas vacías al final.
     """
     df = df.copy()
-    missing = MIN_COLS_A_TO_N - df.shape[1]
+    missing = MIN_COLS_A_TO_O - df.shape[1]
     if missing <= 0:
         return df
 
-    extra_names = ["Valid BoL", "Min", "Max", "Diferencia", "Valor priorizado"]
+    # J..O (6 columnas) cuando faltan:
+    extra_names = ["DIFERENCIA", "Min", "Max", "Diferencia", "Valor priorizado", "RANGO DIFERENCIA"]
 
     if has_header:
         start = max(0, len(extra_names) - missing)
@@ -101,7 +103,7 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
         for i in range(missing):
             df[f"__extra_{i+1}__"] = ""
 
-    while df.shape[1] < MIN_COLS_A_TO_N:
+    while df.shape[1] < MIN_COLS_A_TO_O:
         df[f"__extra_{df.shape[1]+1}__"] = ""
 
     return df
@@ -131,12 +133,12 @@ def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def parse_dates(series: pd.Series, mode: str, dayfirst: bool | None = None) -> pd.Series:
+def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     """
     mode:
       - "MDY": month/day/year (dayfirst=False)
       - "DMY": day/month/year (dayfirst=True)
-      - "AUTO": usa dayfirst según `dayfirst` (si se entrega) o decide por cantidad de parseos
+      - "AUTO": si dayfirst viene definido lo usa, si no decide por cantidad de parseos
     """
     if mode == "MDY":
         return pd.to_datetime(series, errors="coerce", dayfirst=False)
@@ -152,7 +154,7 @@ def parse_dates(series: pd.Series, mode: str, dayfirst: bool | None = None) -> p
     return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
-def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str) -> tuple[dict, dict]:
+def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
     """
     Calcula mapas bol->min_str y bol->max_str usando SOLO filas contenedor (B contiene CONTAINER),
     agrupando por C, tomando fechas desde N (ignorando blancos y "No Valido").
@@ -176,8 +178,8 @@ def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str) -> tu
     sub = pd.DataFrame({"bol": bol, "n": n_clean, "dt": dt})
     sub = sub[sub["bol"] != ""]
 
-    min_map: dict[str, str] = {}
-    max_map: dict[str, str] = {}
+    min_map = {}
+    max_map = {}
 
     for bol_id, g in sub.groupby("bol", sort=False):
         valid = g[g["dt"].notna()]
@@ -189,7 +191,7 @@ def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str) -> tu
         min_dt = valid["dt"].min()
         max_dt = valid["dt"].max()
 
-        # Mantener el string original de N para preservar formato
+        # Mantener string original de N para preservar formato
         min_str = valid.loc[valid["dt"] == min_dt, "n"].iloc[0]
         max_str = valid.loc[valid["dt"] == max_dt, "n"].iloc[0]
 
@@ -239,8 +241,8 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
 
 def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     """
-    Columna J (VALID VOL):
-    - Calcula diferencia en horas entre L y K: (L - K) en horas
+    Columna J (DIFERENCIA):
+    - Diferencia en horas entre L y K: (L - K) en horas
     - Si K/L no es fecha válida o es "No Valido" => J = "No Valido"
     """
     df = df.copy()
@@ -259,7 +261,6 @@ def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
         else str(v).strip()
     )
 
-    # Para AUTO: decidir dayfirst usando K y L juntos
     dayfirst = None
     if date_mode == "AUTO":
         combined = pd.concat([k_clean, l_clean], ignore_index=True)
@@ -275,50 +276,101 @@ def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     def fmt_hours(x):
         if pd.isna(x):
             return "No Valido"
-        # Si es casi entero, dejar entero
-        if abs(x - round(float(x))) < 1e-9:
+        if abs(float(x) - round(float(x))) < 1e-9:
             return str(int(round(float(x))))
         return f"{float(x):.2f}"
 
-    df.iloc[:, IDX_J_VALID_VOL] = diff_hours.apply(fmt_hours)
+    df.iloc[:, IDX_J_DIFF_HOURS] = diff_hours.apply(fmt_hours)
     return df
 
 
-def unique_ids_where_type_contains_bill_of_lading(df: pd.DataFrame) -> list[str]:
-    """BoL únicos = Shipment ID únicos (col A) donde B contiene BILL_OF_LADING (excluye blancos)."""
-    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
-    mask = types_norm.str.contains("BILL_OF_LADING", na=False)
-
-    ids = df.loc[mask].iloc[:, IDX_A_SHIPMENT_ID]
-    unique_ids = set()
-    for v in ids.tolist():
-        if is_blank(v):
-            continue
-        unique_ids.add(str(v).strip())
-
-    return sorted(unique_ids)
-
-
-def unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df: pd.DataFrame) -> list[str]:
+def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
     """
-    BoL inactivos = Shipment ID únicos (col A) donde:
-    - B contiene BILL_OF_LADING
-    - N == 'No Valido'
+    Columna O (RANGO DIFERENCIA) usando J (DIFERENCIA en horas):
+      - J == 0            => "0"
+      - 0 < J <= 24       => "0 - 24 Hrs"
+      - J > 24            => "+ de 24 Hrs"
+      - inválido/No Valido => "No Valido"
     """
-    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
-    mask_type = types_norm.str.contains("BILL_OF_LADING", na=False)
+    df = df.copy()
+    j_raw = df.iloc[:, IDX_J_DIFF_HOURS]
 
-    n_norm = df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
-    mask_invalid = (n_norm == "no valido")
-
-    ids = df.loc[mask_type & mask_invalid].iloc[:, IDX_A_SHIPMENT_ID]
-    unique_ids = set()
-    for v in ids.tolist():
+    def parse_hours(v):
         if is_blank(v):
-            continue
-        unique_ids.add(str(v).strip())
+            return None
+        if normalize_text_for_compare(v) == "no valido":
+            return None
+        s = str(v).strip().replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
 
-    return sorted(unique_ids)
+    def bucket(v):
+        h = parse_hours(v)
+        if h is None:
+            return "No Valido"
+        if h < 0:
+            return "No Valido"
+        if abs(h) < 1e-9:
+            return "0"
+        if h <= 24:
+            return "0 - 24 Hrs"
+        return "+ de 24 Hrs"
+
+    df.iloc[:, IDX_O_RANGE] = j_raw.apply(bucket)
+    return df
+
+
+def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tabla Resumen (solo filas BILL_OF_LADING, contadas por BoL único = col A):
+    - BL únicos
+    - BL válidos (N != No Valido)
+    - BLs con diferencia 0 (O = "0")
+    - BLs con diferencia 0 - 24 Hrs (O = "0 - 24 Hrs")
+    - BLs con diferencia + de 24 Hrs (O = "+ de 24 Hrs")
+    """
+    types_norm = df_out.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_bol.sum() == 0:
+        return pd.DataFrame([
+            {"indicador": "BL únicos", "valor": 0},
+            {"indicador": "BL válidos", "valor": 0},
+            {"indicador": "BLs con diferencia 0", "valor": 0},
+            {"indicador": "BLs con diferencia 0 - 24 Hrs", "valor": 0},
+            {"indicador": "BLs con diferencia + de 24 Hrs", "valor": 0},
+        ])
+
+    bol_df = df_out.loc[mask_bol].copy()
+
+    # BoL único por columna A (Shipment ID) - excluir blancos
+    bol_df["_bol_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
+    bol_df = bol_df[bol_df["_bol_id"].notna()]
+
+    # Si hubiera duplicados, cuenta 1 por BoL (tomamos primera ocurrencia)
+    bol_df = bol_df.drop_duplicates(subset=["_bol_id"], keep="first")
+
+    bl_unicos = int(bol_df["_bol_id"].nunique())
+
+    # BL válidos: N no blanco y N != No Valido
+    n_norm = bol_df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
+    bl_validos = int(((n_norm != "") & (n_norm != "no valido")).sum())
+
+    # Rangos por O
+    o_val = bol_df.iloc[:, IDX_O_RANGE].apply(lambda v: "" if is_blank(v) else str(v).strip())
+    diff_0 = int((o_val == "0").sum())
+    diff_0_24 = int((o_val == "0 - 24 Hrs").sum())
+    diff_gt_24 = int((o_val == "+ de 24 Hrs").sum())
+
+    return pd.DataFrame([
+        {"indicador": "BL únicos", "valor": bl_unicos},
+        {"indicador": "BL válidos", "valor": bl_validos},
+        {"indicador": "BLs con diferencia 0", "valor": diff_0},
+        {"indicador": "BLs con diferencia 0 - 24 Hrs", "valor": diff_0_24},
+        {"indicador": "BLs con diferencia + de 24 Hrs", "valor": diff_gt_24},
+    ])
 
 
 def to_csv_bytes(df: pd.DataFrame, sep: str, include_header: bool) -> bytes:
@@ -328,17 +380,6 @@ def to_csv_bytes(df: pd.DataFrame, sep: str, include_header: bool) -> bytes:
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="Reporte CSV", layout="wide")
 st.title("Reporte CSV: Tabla Resumen + Archivo completo")
-
-st.markdown(
-    """
-**Reglas actuales:**
-1) **N (Valor priorizado)** = H si existe, si no G, si no `No Valido`  
-2) Min/Max desde contenedores (B contiene CONTAINER), agrupando por C y usando N  
-   - K/L en filas Container  
-3) Aplicar ese Min/Max a filas BILL_OF_LADING  
-4) **J (VALID VOL)** = diferencia en horas entre **L y K** (si no se puede calcular: `No Valido`)
-"""
-)
 
 uploaded = st.file_uploader("Sube tu archivo CSV", type=["csv"])
 has_header = st.checkbox("Mi archivo tiene encabezados (header)", value=True)
@@ -363,74 +404,38 @@ if uploaded:
 
         df = ensure_min_columns(df, has_header)
 
-        if df.shape[1] < MIN_COLS_A_TO_N:
-            st.error("El archivo no tiene suficientes columnas para llegar hasta la columna N (A..N).")
+        if df.shape[1] < MIN_COLS_A_TO_O:
+            st.error("El archivo no tiene suficientes columnas para llegar hasta la columna O (A..O).")
             st.stop()
 
         if st.button("Procesar"):
-            # 1) Calcular N
+            # 1) N
             df_out = compute_valor_priorizado(df)
 
-            # 2) Calcular min/max desde contenedores
+            # 2) min/max desde contenedores
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
 
-            # 2a) Aplicar a filas Container
+            # 2a) K/L para contenedores
             df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
 
-            # 3) Aplicar a filas BILL_OF_LADING
+            # 3) K/L para filas BILL_OF_LADING
             df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map)
 
-            # 4) Calcular J = horas entre K y L
+            # 4) J = horas (L-K)
             df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
 
-            # Resumen (se mantiene)
-            bol_unique_ids = unique_ids_where_type_contains_bill_of_lading(df_out)
-            bol_inactive_ids = unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df_out)
+            # 5) O = rango diferencia desde J
+            df_out = fill_range_in_o(df_out)
 
-            bol_unique_count = len(bol_unique_ids)
-            bol_inactive_count = len(bol_inactive_ids)
-            bol_with_date_count = bol_unique_count - bol_inactive_count
-
-            resumen = pd.DataFrame([
-                {
-                    "indicador": "BoL únicos (Shipment ID col A) donde Shipment type (col B) contiene BILL_OF_LADING (sin blancos)",
-                    "valor": bol_unique_count,
-                },
-                {
-                    "indicador": "BoL inactivos: de esos BoL únicos, cuántos tienen Valor priorizado (col N) = No Valido",
-                    "valor": bol_inactive_count,
-                },
-                {
-                    "indicador": "BoL con fecha: de esos BoL únicos, cuántos tienen Valor priorizado (col N) distinto de No Valido",
-                    "valor": bol_with_date_count,
-                },
-            ])
+            # 6) Tabla Resumen con los indicadores solicitados
+            resumen = build_summary_counts(df_out)
 
             st.success("Listo.")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("BoL únicos", bol_unique_count)
-            with c2:
-                st.metric("BoL inactivos (N=No Valido)", bol_inactive_count)
-            with c3:
-                st.metric("BoL con fecha", bol_with_date_count)
 
-            st.download_button(
-                "Descargar Tabla Resumen.csv",
-                data=to_csv_bytes(resumen, sep=",", include_header=True),
-                file_name="Tabla Resumen.csv",
-                mime="text/csv",
-            )
-
-            st.download_button(
-                "Descargar Archivo completo.csv",
-                data=to_csv_bytes(df_out, sep=sep, include_header=has_header),
-                file_name="Archivo completo.csv",
-                mime="text/csv",
-            )
-
-            with st.expander("Vista previa (primeras 20 filas)"):
-                st.dataframe(df_out.head(20), use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error leyendo o procesando el CSV: {e}")
+            # Mostrar métricas rápidas
+            if len(resumen) == 5:
+                cols = st.columns(5)
+                cols[0].metric(resumen.iloc[0]["indicador"], int(resumen.iloc[0]["valor"]))
+                cols[1].metric(resumen.iloc[1]["indicador"], int(resumen.iloc[1]["valor"]))
+                cols[2].metric(resumen.iloc[2]["indicador"], int(resumen.iloc[2]["valor"]))
+                cols[3].metric(resumen.iloc[3]["]()
