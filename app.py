@@ -1,18 +1,19 @@
 # app.py
 import csv
-from io import BytesIO, StringIO
-from pathlib import Path
-
+from io import StringIO
 import pandas as pd
 import streamlit as st
 
 # Índices 0-based por letra:
 # A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10 L=11 M=12 N=13
-IDX_BOL = 2
-IDX_ESTIMATED = 6
-IDX_ACTUAL = 7
-IDX_PRIORITIZED = 13  # N
-MIN_COLS_A_TO_N = 14  # A..N
+IDX_SHIPMENT_ID = 0        # A
+IDX_SHIPMENT_TYPE = 1      # B
+IDX_ESTIMATED = 6          # G
+IDX_ACTUAL = 7             # H
+IDX_PRIORITIZED = 13       # N
+MIN_COLS_A_TO_N = 14       # A..N
+
+TARGET_TYPE = "BILL_OF_LADING"
 
 
 def sniff_delimiter(raw_text: str) -> str:
@@ -21,7 +22,6 @@ def sniff_delimiter(raw_text: str) -> str:
         dialect = csv.Sniffer().sniff(sample, delimiters=[",", ";", "\t", "|"])
         return dialect.delimiter
     except Exception:
-        # fallback
         return ","
 
 
@@ -34,54 +34,69 @@ def is_blank(x) -> bool:
     return str(x).strip() == ""
 
 
+def normalize_type(x) -> str:
+    """
+    Normaliza Shipment type para comparación robusta:
+    - strip
+    - upper
+    - espacios -> underscore
+    """
+    if is_blank(x):
+        return ""
+    return str(x).strip().upper().replace(" ", "_")
+
+
 def ensure_min_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Asegura al menos A..N (14 cols).
-    Si faltan, agrega columnas J..N con nombres correctos (si hay headers).
+    Si faltan, agrega columnas hasta completar.
     """
     df = df.copy()
     missing = MIN_COLS_A_TO_N - df.shape[1]
     if missing <= 0:
         return df
 
-    # Nombres sugeridos para J..N (en orden)
+    # Nombres sugeridos para J..N (en orden) si existen headers
     extra_names = ["Valid BoL", "Min", "Max", "Diferencia", "Valor priorizado"]
-    # Determinar desde qué columna extra partimos (si faltan varias)
-    # Si df tiene 9 columnas (A..I), faltan 5 => añadimos J..N completos.
-    # Si df tiene 10 columnas, faltan 4 => añadimos K..N, etc.
-    start_extra_idx = max(0, len(extra_names) - missing)
 
+    # Si faltan 5, añadimos J..N; si faltan 4, añadimos K..N, etc.
+    start_extra_idx = max(0, len(extra_names) - missing)
     for name in extra_names[start_extra_idx:]:
         df[name] = ""
 
-    # Si aún faltara algo por un caso raro, completa genérico
     while df.shape[1] < MIN_COLS_A_TO_N:
         df[f"__extra_{df.shape[1]+1}__"] = ""
 
     return df
 
 
-def count_unique_bol_excluding_blanks(series_c: pd.Series) -> int:
+def count_unique_shipment_id_where_type_is_bol(df: pd.DataFrame) -> int:
     """
-    Cuenta únicos en columna C excluyendo:
-    - NaN/None
-    - "" o whitespace-only
-    Normaliza usando strip() para evitar que "ABC" y "ABC " cuenten distinto.
+    Paso 1:
+    Cuenta únicos de columna A (Shipment ID) SOLO donde columna B es BILL_OF_LADING,
+    excluyendo blancos/NULL/solo espacios.
     """
-    vals = []
-    for v in series_c.tolist():
+    types = df.iloc[:, IDX_SHIPMENT_TYPE].apply(normalize_type)
+    mask_bol = (types == TARGET_TYPE)
+
+    ids = df.loc[mask_bol].iloc[:, IDX_SHIPMENT_ID]
+
+    cleaned = []
+    for v in ids.tolist():
         if is_blank(v):
             continue
-        vals.append(str(v).strip())
-    return int(pd.Series(vals).nunique(dropna=True))
+        cleaned.append(str(v).strip())
+
+    return int(pd.Series(cleaned).nunique(dropna=True))
 
 
 def compute_prioritized_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Columna N:
+    Paso 2: Columna N (Valor priorizado)
     - Si H tiene valor -> N = H
     - Si no, si G tiene valor -> N = G
     - Si no -> "No Valido"
+    (whitespace-only cuenta como blanco)
     """
     df = df.copy()
     g = df.iloc[:, IDX_ESTIMATED]
@@ -102,7 +117,7 @@ def compute_prioritized_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def df_to_csv_bytes(df: pd.DataFrame, delimiter: str, include_header: bool) -> bytes:
     s = df.to_csv(index=False, sep=delimiter, header=include_header)
-    # utf-8-sig para que Excel lo abra bien (especialmente tildes)
+    # utf-8-sig ayuda a que Excel lo abra bien (tildes)
     return s.encode("utf-8-sig")
 
 
@@ -111,8 +126,8 @@ st.title("Reporte (CSV): Tabla Resumen + Archivo completo")
 
 st.write(
     """
-**Reglas:**
-1) Contar valores únicos en **columna C (Bill of lading)** excluyendo blancos/NULL/solo espacios.  
+**Reglas (solo lo pedido):**
+1) Contar **Shipment ID únicos (columna A)** **solo** en filas donde **Shipment type (columna B)** es **BILL_OF_LADING**, excluyendo blancos/NULL/solo espacios.  
 2) Calcular **columna N (Valor priorizado)**:
 - Si **H** tiene valor → N = H  
 - Si no, si **G** tiene valor → N = G  
@@ -122,11 +137,9 @@ st.write(
 )
 
 uploaded = st.file_uploader("Sube tu archivo CSV", type=["csv"])
-
 has_header = st.checkbox("Mi archivo tiene encabezados (header)", value=True)
 
 if uploaded:
-    # Leer bytes -> texto (con tolerancia a BOM)
     raw_bytes = uploaded.getvalue()
     raw_text = raw_bytes.decode("utf-8-sig", errors="replace")
 
@@ -141,44 +154,4 @@ if uploaded:
 
         df = ensure_min_columns(df)
 
-        if st.button("Procesar"):
-            # 1) Conteo únicos en C (excluyendo blancos)
-            unique_count = count_unique_bol_excluding_blanks(df.iloc[:, IDX_BOL])
-
-            # 2) Columna N (Valor priorizado)
-            df_out = compute_prioritized_column(df)
-
-            # Archivo 1: Tabla Resumen
-            resumen = pd.DataFrame([{
-                "indicador": "Cantidad de valores únicos en columna C (Bill of lading) sin blancos",
-                "valor": unique_count
-            }])
-
-            # Convertir a bytes para descarga
-            resumen_bytes = df_to_csv_bytes(resumen, delimiter=",", include_header=True)
-            completo_bytes = df_to_csv_bytes(df_out, delimiter=delim, include_header=has_header)
-
-            st.success("Listo.")
-            st.metric("BOL únicos (columna C) sin blancos", unique_count)
-
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Descargar Tabla Resumen.csv",
-                    data=resumen_bytes,
-                    file_name="Tabla Resumen.csv",
-                    mime="text/csv",
-                )
-            with c2:
-                st.download_button(
-                    "Descargar Archivo completo.csv",
-                    data=completo_bytes,
-                    file_name="Archivo completo.csv",
-                    mime="text/csv",
-                )
-
-            with st.expander("Vista previa (primeras 20 filas del Archivo completo)"):
-                st.dataframe(df_out.head(20), use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error leyendo o procesando el CSV: {e}")
+        if df.shape[1] < MIN_COLS_A_TO_N:
