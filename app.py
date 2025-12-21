@@ -89,6 +89,7 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     if has_header:
         start = max(0, len(extra_names) - missing)
         for name in extra_names[start:]:
+            # Evita choque si ya existe el nombre
             col_name = name
             if col_name in df.columns:
                 i = 2
@@ -145,30 +146,34 @@ def parse_dates(series: pd.Series, mode: str) -> pd.Series:
     # AUTO
     dt_mdy = pd.to_datetime(series, errors="coerce", dayfirst=False)
     dt_dmy = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    if dt_dmy.notna().sum() > dt_mdy.notna().sum():
-        return dt_dmy
-    return dt_mdy
+    return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
-def fill_min_max_by_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+def fill_min_max_for_container_rows_only(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     """
-    Agrupa por BOL (col C).
-    Considera solo filas donde Shipment type (col B) contiene 'CONTAINER'.
-    Calcula min/max de fechas en col N (ignorando blancos y 'No Valido').
-    Escribe:
-      - K (Min) = fecha mínima del BOL (más antigua)
-      - L (Max) = fecha máxima del BOL (más futura)
-    Si no hay fecha válida para el BOL, K y L = 'No Valido'.
+    Calcula K (Min) y L (Max) SOLO para filas donde Shipment type (col B) es Container*,
+    agrupando por BOL (col C), usando fechas de N (col N).
+
+    - Ignora blancos y "No Valido" en N.
+    - Si un BOL no tiene fechas válidas en contenedores => K y L = "No Valido" (solo en filas contenedor).
+    - NO rellena K/L en filas BILL_OF_LADING (eso queda para el siguiente paso).
     """
     df = df.copy()
 
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
-    mask_container = types_norm.str.contains("CONTAINER", na=False)
 
-    bol = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    n_raw = df.loc[mask_container].iloc[:, IDX_N_PRIORITIZED]
+    # Contenedor: contiene CONTAINER pero NO contiene BILL_OF_LADING
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
 
-    # limpiar N: None si blanco o 'No Valido'
+    if mask_container.sum() == 0:
+        return df  # no hay contenedores
+
+    bol_all = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    bol_container = bol_all[mask_container]
+
+    n_raw = df.iloc[:, IDX_N_PRIORITIZED][mask_container]
+
+    # Limpieza: convertir a None si es blanco o "No Valido"
     n_clean = n_raw.apply(
         lambda v: None
         if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
@@ -177,8 +182,8 @@ def fill_min_max_by_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.
 
     dt = parse_dates(n_clean, mode=date_mode)
 
-    sub = pd.DataFrame({"bol": bol, "n": n_clean, "dt": dt})
-    sub = sub[sub["bol"] != ""]  # sin BOL no se agrupa
+    sub = pd.DataFrame({"bol": bol_container, "n": n_clean, "dt": dt})
+    sub = sub[sub["bol"] != ""]  # sin BOL no se puede agrupar
 
     min_map = {}
     max_map = {}
@@ -193,22 +198,23 @@ def fill_min_max_by_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.
         min_dt = valid["dt"].min()
         max_dt = valid["dt"].max()
 
-        # recuperar el string original de N para mantener formato
+        # mantener el string original de N para conservar formato
         min_str = valid.loc[valid["dt"] == min_dt, "n"].iloc[0]
         max_str = valid.loc[valid["dt"] == max_dt, "n"].iloc[0]
 
         min_map[bol_id] = min_str
         max_map[bol_id] = max_str
 
-    # asegurar que todo BOL presente en col C tenga algo (si no tuvo contenedores => No Valido)
-    all_bols = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    for b in sorted(set(x for x in all_bols.tolist() if x != "")):
-        min_map.setdefault(b, "No Valido")
-        max_map.setdefault(b, "No Valido")
+    colK = df.columns[IDX_K_MIN]
+    colL = df.columns[IDX_L_MAX]
 
-    # escribir K y L en todas las filas según su BOL (col C)
-    df.iloc[:, IDX_K_MIN] = all_bols.map(min_map).fillna("")
-    df.iloc[:, IDX_L_MAX] = all_bols.map(max_map).fillna("")
+    # Asignar SOLO en filas contenedor
+    k_vals = bol_container.map(min_map).fillna("No Valido")
+    l_vals = bol_container.map(max_map).fillna("No Valido")
+
+    df.loc[mask_container, colK] = k_vals
+    df.loc[mask_container, colL] = l_vals
+
     return df
 
 
@@ -264,9 +270,10 @@ st.title("Reporte CSV: Tabla Resumen + Archivo completo")
 
 st.markdown(
     """
-**Incluye el nuevo paso Min/Max por BOL:**
-- **N (Valor priorizado)**: H si existe, si no G, si no `No Valido`
-- **K (Min)** y **L (Max)**: por **BOL (col C)**, considerando solo **contenedores** (col B contiene `CONTAINER`)
+**Reglas actuales:**
+1) Calcula **N (Valor priorizado)**: H si existe, si no G, si no `No Valido`.  
+2) Calcula **K (Min)** y **L (Max)** **SOLO en filas Container** (col B contiene `CONTAINER`), agrupando por **BOL (col C)** y usando **N**.  
+3) Tabla Resumen: BoL únicos, BoL inactivos (N=No Valido), BoL con fecha.
 """
 )
 
@@ -298,19 +305,19 @@ if uploaded:
             st.stop()
 
         if st.button("Procesar"):
-            # 1) Calcular N
+            # Paso 1: N
             df_out = compute_valor_priorizado(df)
 
-            # 2) Calcular K y L desde contenedores agrupados por C
-            df_out = fill_min_max_by_bol_from_containers(df_out, date_mode=date_mode)
+            # Paso 2: K/L SOLO para contenedores
+            df_out = fill_min_max_for_container_rows_only(df_out, date_mode=date_mode)
 
-            # 3) Resumen: BOL únicos / inactivos / con fecha
+            # Resumen: BoL únicos / inactivos / con fecha (basado en filas BILL_OF_LADING)
             bol_unique_ids = unique_ids_where_type_contains_bill_of_lading(df_out)
             bol_inactive_ids = unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df_out)
 
             bol_unique_count = len(bol_unique_ids)
             bol_inactive_count = len(bol_inactive_ids)
-            bol_with_date_count = bol_unique_count - bol_inactive_count  # complemento
+            bol_with_date_count = bol_unique_count - bol_inactive_count
 
             resumen = pd.DataFrame([
                 {
@@ -336,7 +343,6 @@ if uploaded:
             with c3:
                 st.metric("BoL con fecha", bol_with_date_count)
 
-            # Descargas (2 archivos)
             st.download_button(
                 "Descargar Tabla Resumen.csv",
                 data=to_csv_bytes(resumen, sep=",", include_header=True),
