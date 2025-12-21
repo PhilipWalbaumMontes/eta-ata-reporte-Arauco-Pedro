@@ -14,10 +14,10 @@ IDX_C_BOL = 2
 IDX_G_ESTIMATED = 6
 IDX_H_ACTUAL = 7
 
-IDX_J_DIFF_HOURS = 9          # J = DIFERENCIA (horas)
+IDX_J_DIFF_HOURS = 9          # J = diferencia (horas)
 IDX_K_MIN = 10                # K = Min (fecha)
 IDX_L_MAX = 11                # L = Max (fecha)
-IDX_M_UNUSED = 12             # M = NO USAR (debe quedar vacío y sin header)
+IDX_M_UNUSED = 12             # M = NO USAR (vacía)
 IDX_N_PRIORITIZED = 13        # N = Valor priorizado
 IDX_O_RANGE = 14              # O = RANGO DIFERENCIA
 
@@ -54,10 +54,7 @@ def normalize_type(x) -> str:
 def normalize_text_for_compare(x) -> str:
     """
     Normaliza texto para comparar (ej: 'No Valido' vs 'no válido'):
-    - strip
-    - lower
-    - colapsa espacios
-    - elimina tildes/acentos
+    - strip, lower, colapsa espacios, elimina tildes
     """
     if is_blank(x):
         return ""
@@ -69,7 +66,7 @@ def normalize_text_for_compare(x) -> str:
 
 
 def clean_bol_key(x) -> str:
-    """Clave limpia para agrupar BOL (col C)."""
+    """Clave limpia para Bill of lading (col C)."""
     if is_blank(x):
         return ""
     s = str(x).strip()
@@ -80,26 +77,24 @@ def clean_bol_key(x) -> str:
 
 def ensure_columns_and_force_headers(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     """
-    - Asegura al menos A..O (15 columnas).
-    - Fuerza headers por posición:
-        J = DIFERENCIA
-        K = Min
-        L = Max
-        M = header vacío
-        N = Valor priorizado
-        O = RANGO DIFERENCIA
+    Asegura A..O y fuerza headers por posición:
+      - J = diferencia
+      - K = Min
+      - L = Max
+      - M = header vacío
+      - N = Valor priorizado
+      - O = RANGO DIFERENCIA
     """
     df = df.copy()
-
     while df.shape[1] < MIN_COLS_A_TO_O:
         df[f"__extra_{df.shape[1] + 1}__"] = ""
 
     if has_header:
         cols = list(df.columns)
-        cols[IDX_J_DIFF_HOURS] = "DIFERENCIA"
+        cols[IDX_J_DIFF_HOURS] = "diferencia"
         cols[IDX_K_MIN] = "Min"
         cols[IDX_L_MAX] = "Max"
-        cols[IDX_M_UNUSED] = ""  # M sin título (para que no aparezca "DIFERENCIA" duplicado)
+        cols[IDX_M_UNUSED] = ""  # M sin título
         cols[IDX_N_PRIORITIZED] = "Valor priorizado"
         cols[IDX_O_RANGE] = "RANGO DIFERENCIA"
         df.columns = cols
@@ -133,10 +128,7 @@ def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     """
-    mode:
-      - "MDY": month/day/year (dayfirst=False)
-      - "DMY": day/month/year (dayfirst=True)
-      - "AUTO": decide por cantidad de parseos exitosos (o usa dayfirst si se entrega)
+    mode: MDY / DMY / AUTO
     """
     if mode == "MDY":
         return pd.to_datetime(series, errors="coerce", dayfirst=False)
@@ -154,8 +146,8 @@ def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
 
 def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
     """
-    Calcula bol->min_str y bol->max_str usando SOLO filas contenedor (B contiene CONTAINER),
-    agrupando por C, tomando fechas desde N (ignorando blancos y "No Valido").
+    Mapas bol->min_str y bol->max_str usando SOLO filas contenedor (B contiene CONTAINER),
+    agrupando por C y usando N (ignorando blancos y "No Valido").
     """
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -199,7 +191,7 @@ def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
 
 
 def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
-    """Rellena K/L SOLO en filas contenedor usando col C como llave."""
+    """K/L solo para contenedores."""
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -215,7 +207,7 @@ def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) 
 
 
 def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
-    """Rellena K/L SOLO en filas BILL_OF_LADING usando el min/max desde contenedores."""
+    """K/L para filas BILL_OF_LADING usando min/max de contenedores del mismo C."""
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -232,9 +224,7 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
 
 def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     """
-    J (DIFERENCIA):
-    - Diferencia en horas entre L y K: (L - K) en horas
-    - Si K/L no es fecha válida o es "No Valido" => J = "No Valido"
+    J (diferencia): horas entre L y K.
     """
     df = df.copy()
 
@@ -269,13 +259,14 @@ def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
 
 def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
     """
-    O (RANGO DIFERENCIA) usando J:
-      - J == 0            => "0"
-      - 0 < J <= 24       => "0 - 24 Hrs"
-      - J > 24            => "+ de 24 Hrs"
-      - inválido => "No Valido"
+    O (RANGO DIFERENCIA) desde J:
+      - 0
+      - 0 - 24 Hrs (incluye 24)
+      - + de 24 Hrs
+      - No Valido
     """
     df = df.copy()
+    j_raw = df.iloc[:, IDX_J_DIFF_HOURS]
 
     def parse_hours(v):
         if is_blank(v) or normalize_text_for_compare(v) == "no valido":
@@ -296,27 +287,31 @@ def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
             return "0 - 24 Hrs"
         return "+ de 24 Hrs"
 
-    df.iloc[:, IDX_O_RANGE] = df.iloc[:, IDX_J_DIFF_HOURS].apply(bucket)
+    df.iloc[:, IDX_O_RANGE] = j_raw.apply(bucket)
     return df
 
 
 def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
     """
-    Resumen solicitado (contando BL únicos por col A SOLO en filas BILL_OF_LADING):
+    Resumen: contar SOLO BL (filas donde B contiene BILL_OF_LADING),
+    y BL único se define por columna C (Bill of lading).
 
-    - BL totales de la base
-    - BL válidos (N distinto de No Valido)
-    - BL no válidos
-    - BLs con diferencia (O distinto de No Valido)
-    - BLs con diferencia menor a 24 horas (O en {"0", "0 - 24 Hrs"})
-    - BLs con diferencia mayor a 24 horas (O == "+ de 24 Hrs")
+    Filas:
+      - BL totales de la base
+      - BL válidos
+      - BL no válidos
+      - BLs con diferencia
+      - BLs con diferencia menor a 24 horas (incluye 0 y 0-24)
+      - BLs con diferencia mayor a 24 horas
     """
     types_norm = df_out.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
 
     bol_df = df_out.loc[mask_bol].copy()
-    bol_df["_bl_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
-    bol_df = bol_df[bol_df["_bl_id"].notna()]
+
+    # BL ID = columna C (Bill of lading)
+    bol_df["_bl_id"] = bol_df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    bol_df = bol_df[bol_df["_bl_id"] != ""]
 
     if bol_df.empty:
         return pd.DataFrame([
@@ -336,7 +331,7 @@ def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
     # válido si existe al menos un N no vacío y distinto de "no valido"
     valid_flag = grp["_n_norm"].apply(lambda s: ((s != "") & (s != "no valido")).any())
 
-    # rango por BL (si hubiera duplicados, tomamos el "peor" para no subestimar)
+    # si hubiese duplicados por BL, tomamos el "peor" rango (no subestimar)
     def agg_range(s: pd.Series) -> str:
         vals = set(s.tolist())
         if "+ de 24 Hrs" in vals:
@@ -350,20 +345,20 @@ def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
     range_val = grp["_o_val"].apply(agg_range)
 
     total_bl = int(valid_flag.shape[0])
-    valid_bl = int(valid_flag.sum())
-    invalid_bl = total_bl - valid_bl
+    bl_validos = int(valid_flag.sum())
+    bl_no_validos = total_bl - bl_validos
 
-    with_diff = int(range_val.isin({"0", "0 - 24 Hrs", "+ de 24 Hrs"}).sum())
-    diff_le_24 = int(range_val.isin({"0", "0 - 24 Hrs"}).sum())
-    diff_gt_24 = int((range_val == "+ de 24 Hrs").sum())
+    bl_con_diferencia = int(range_val.isin({"0", "0 - 24 Hrs", "+ de 24 Hrs"}).sum())
+    bl_menor_24 = int(range_val.isin({"0", "0 - 24 Hrs"}).sum())
+    bl_mayor_24 = int((range_val == "+ de 24 Hrs").sum())
 
     return pd.DataFrame([
         {"indicador": "BL totales de la base", "valor": total_bl},
-        {"indicador": "BL válidos", "valor": valid_bl},
-        {"indicador": "BL no válidos", "valor": invalid_bl},
-        {"indicador": "BLs con diferencia", "valor": with_diff},
-        {"indicador": "BLs con diferencia menor a 24 horas", "valor": diff_le_24},
-        {"indicador": "BLs con diferencia mayor a 24 horas", "valor": diff_gt_24},
+        {"indicador": "BL válidos", "valor": bl_validos},
+        {"indicador": "BL no válidos", "valor": bl_no_validos},
+        {"indicador": "BLs con diferencia", "valor": bl_con_diferencia},
+        {"indicador": "BLs con diferencia menor a 24 horas", "valor": bl_menor_24},
+        {"indicador": "BLs con diferencia mayor a 24 horas", "valor": bl_mayor_24},
     ])
 
 
@@ -400,7 +395,7 @@ if uploaded:
         if st.button("Procesar"):
             df_out = compute_valor_priorizado(df)
 
-            # Asegurar que M esté vacío SIEMPRE (evita duplicación con J)
+            # M debe quedar vacía SIEMPRE (evita duplicación con J)
             df_out.iloc[:, IDX_M_UNUSED] = ""
 
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
@@ -411,7 +406,7 @@ if uploaded:
             df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
             df_out = fill_range_in_o(df_out)
 
-            # Refuerzo final: M vacío
+            # Refuerzo final
             df_out.iloc[:, IDX_M_UNUSED] = ""
 
             resumen = build_summary_counts(df_out)
