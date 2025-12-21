@@ -191,7 +191,6 @@ def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
         min_dt = valid["dt"].min()
         max_dt = valid["dt"].max()
 
-        # Mantener string original de N para preservar formato
         min_str = valid.loc[valid["dt"] == min_dt, "n"].iloc[0]
         max_str = valid.loc[valid["dt"] == max_dt, "n"].iloc[0]
 
@@ -250,16 +249,8 @@ def fill_hours_diff_in_j(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     k_raw = df.iloc[:, IDX_K_MIN]
     l_raw = df.iloc[:, IDX_L_MAX]
 
-    k_clean = k_raw.apply(
-        lambda v: None
-        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
-        else str(v).strip()
-    )
-    l_clean = l_raw.apply(
-        lambda v: None
-        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
-        else str(v).strip()
-    )
+    k_clean = k_raw.apply(lambda v: None if (is_blank(v) or normalize_text_for_compare(v) == "no valido") else str(v).strip())
+    l_clean = l_raw.apply(lambda v: None if (is_blank(v) or normalize_text_for_compare(v) == "no valido") else str(v).strip())
 
     dayfirst = None
     if date_mode == "AUTO":
@@ -296,9 +287,7 @@ def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
     j_raw = df.iloc[:, IDX_J_DIFF_HOURS]
 
     def parse_hours(v):
-        if is_blank(v):
-            return None
-        if normalize_text_for_compare(v) == "no valido":
+        if is_blank(v) or normalize_text_for_compare(v) == "no valido":
             return None
         s = str(v).strip().replace(",", ".")
         try:
@@ -308,9 +297,7 @@ def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
 
     def bucket(v):
         h = parse_hours(v)
-        if h is None:
-            return "No Valido"
-        if h < 0:
+        if h is None or h < 0:
             return "No Valido"
         if abs(h) < 1e-9:
             return "0"
@@ -324,12 +311,12 @@ def fill_range_in_o(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
     """
-    Tabla Resumen (solo filas BILL_OF_LADING, contadas por BoL único = col A):
+    Tabla Resumen (solo filas BILL_OF_LADING, contadas por BL único = col A):
     - BL únicos
     - BL válidos (N != No Valido)
-    - BLs con diferencia 0 (O = "0")
-    - BLs con diferencia 0 - 24 Hrs (O = "0 - 24 Hrs")
-    - BLs con diferencia + de 24 Hrs (O = "+ de 24 Hrs")
+    - BLs con diferencia 0
+    - BLs con diferencia 0 - 24 Hrs
+    - BLs con diferencia + de 24 Hrs
     """
     types_norm = df_out.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -346,13 +333,13 @@ def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
     bol_df = df_out.loc[mask_bol].copy()
 
     # BoL único por columna A (Shipment ID) - excluir blancos
-    bol_df["_bol_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
-    bol_df = bol_df[bol_df["_bol_id"].notna()]
+    bol_df["_bl_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
+    bol_df = bol_df[bol_df["_bl_id"].notna()]
 
-    # Si hubiera duplicados, cuenta 1 por BoL (tomamos primera ocurrencia)
-    bol_df = bol_df.drop_duplicates(subset=["_bol_id"], keep="first")
+    # Un registro por BL (por si hay duplicados)
+    bol_df = bol_df.drop_duplicates(subset=["_bl_id"], keep="first")
 
-    bl_unicos = int(bol_df["_bol_id"].nunique())
+    bl_unicos = int(bol_df["_bl_id"].nunique())
 
     # BL válidos: N no blanco y N != No Valido
     n_norm = bol_df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
@@ -393,7 +380,6 @@ if uploaded:
         "Formato de fecha para cálculos (N/K/L)",
         options=["AUTO", "MDY", "DMY"],
         index=0,
-        help="AUTO elige el que parsea más valores. MDY = mes/día/año. DMY = día/mes/año.",
     )
 
     try:
@@ -409,33 +395,39 @@ if uploaded:
             st.stop()
 
         if st.button("Procesar"):
-            # 1) N
             df_out = compute_valor_priorizado(df)
 
-            # 2) min/max desde contenedores
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
 
-            # 2a) K/L para contenedores
             df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
-
-            # 3) K/L para filas BILL_OF_LADING
             df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map)
 
-            # 4) J = horas (L-K)
             df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
-
-            # 5) O = rango diferencia desde J
             df_out = fill_range_in_o(df_out)
 
-            # 6) Tabla Resumen con los indicadores solicitados
             resumen = build_summary_counts(df_out)
 
             st.success("Listo.")
 
-            # Mostrar métricas rápidas
-            if len(resumen) == 5:
-                cols = st.columns(5)
-                cols[0].metric(resumen.iloc[0]["indicador"], int(resumen.iloc[0]["valor"]))
-                cols[1].metric(resumen.iloc[1]["indicador"], int(resumen.iloc[1]["valor"]))
-                cols[2].metric(resumen.iloc[2]["indicador"], int(resumen.iloc[2]["valor"]))
-                cols[3].metric(resumen.iloc[3]["]()
+            st.subheader("Tabla Resumen")
+            st.dataframe(resumen, use_container_width=True)
+
+            st.download_button(
+                "Descargar Tabla Resumen.csv",
+                data=to_csv_bytes(resumen, sep=",", include_header=True),
+                file_name="Tabla Resumen.csv",
+                mime="text/csv",
+            )
+
+            st.download_button(
+                "Descargar Archivo completo.csv",
+                data=to_csv_bytes(df_out, sep=sep, include_header=has_header),
+                file_name="Archivo completo.csv",
+                mime="text/csv",
+            )
+
+            with st.expander("Vista previa (primeras 20 filas)"):
+                st.dataframe(df_out.head(20), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error leyendo o procesando el CSV: {e}")
