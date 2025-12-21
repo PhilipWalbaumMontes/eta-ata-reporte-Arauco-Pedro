@@ -1,4 +1,5 @@
 import csv
+import unicodedata
 from io import StringIO
 
 import pandas as pd
@@ -42,6 +43,23 @@ def normalize_type(x) -> str:
     return str(x).strip().upper().replace(" ", "_")
 
 
+def normalize_text_for_compare(x) -> str:
+    """
+    Normaliza texto para comparar (por ejemplo 'No Valido' vs 'no válido'):
+    - strip
+    - lower
+    - colapsa espacios
+    - elimina tildes/acentos
+    """
+    if is_blank(x):
+        return ""
+    s = str(x).strip().lower()
+    s = " ".join(s.split())
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+
 def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     """
     Asegura al menos A..N (14 columnas). Si faltan, agrega columnas vacías al final.
@@ -55,10 +73,16 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     extra_names = ["Valid BoL", "Min", "Max", "Diferencia", "Valor priorizado"]
 
     if has_header:
-        # Si faltan 5 => agrega J..N; si faltan 4 => agrega K..N; etc.
         start = max(0, len(extra_names) - missing)
         for name in extra_names[start:]:
-            df[name] = ""
+            # Evita choque si ya existe el nombre
+            col_name = name
+            if col_name in df.columns:
+                i = 2
+                while f"{col_name}_{i}" in df.columns:
+                    i += 1
+                col_name = f"{col_name}_{i}"
+            df[col_name] = ""
     else:
         for i in range(missing):
             df[f"__extra_{i+1}__"] = ""
@@ -69,11 +93,10 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     return df
 
 
-def unique_shipment_ids_where_type_contains_bol(df: pd.DataFrame) -> list[str]:
+def unique_ids_where_type_contains_bill_of_lading(df: pd.DataFrame) -> list[str]:
     """
-    Paso 1:
-    Revisa todos los valores únicos de A (Shipment ID) SOLO donde B contiene BILL_OF_LADING.
-    Excluye blancos/NULL/solo espacios.
+    Lista de Shipment ID únicos (col A) donde Shipment type (col B)
+    CONTIENE 'BILL_OF_LADING'. Excluye blancos en A.
     """
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -89,11 +112,37 @@ def unique_shipment_ids_where_type_contains_bol(df: pd.DataFrame) -> list[str]:
     return sorted(unique_ids)
 
 
+def unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df: pd.DataFrame) -> list[str]:
+    """
+    Lista de Shipment ID únicos (col A) donde:
+    - B contiene BILL_OF_LADING
+    - N (Valor priorizado) == 'No Valido' (robusto a mayúsculas/tildes)
+    Excluye blancos en A.
+    """
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_type = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    n_norm = df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
+    mask_invalid = (n_norm == "no valido")
+
+    ids = df.loc[mask_type & mask_invalid].iloc[:, IDX_A_SHIPMENT_ID]
+
+    unique_ids = set()
+    for v in ids.tolist():
+        if is_blank(v):
+            continue
+        unique_ids.add(str(v).strip())
+
+    return sorted(unique_ids)
+
+
 def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Paso 2:
-    N (Valor priorizado) = H si existe, si no G, si no 'No Valido'
-    (valores con solo espacios cuentan como blanco)
+    Columna N (Valor priorizado):
+    - Si H tiene valor -> N = H
+    - Si no, si G tiene valor -> N = G
+    - Si no -> "No Valido"
+    (whitespace-only cuenta como blanco)
     """
     df = df.copy()
     g = df.iloc[:, IDX_G_ESTIMATED]
@@ -122,13 +171,10 @@ st.title("Reporte CSV: Tabla Resumen + Archivo completo")
 
 st.markdown(
     """
-**Reglas (solo lo pedido):**
-1) **Paso 1:** Revisar **Shipment ID únicos (col A)** donde **Shipment type (col B) contiene `BILL_OF_LADING`**  
-   - excluye blancos/NULL/solo espacios  
-2) **Paso 2:** Calcular **columna N (Valor priorizado)**  
-   - si **H** tiene valor → N = H  
-   - si no, si **G** tiene valor → N = G  
-   - si no → `No Valido`
+**Reglas (incluye el nuevo Paso 3):**
+1) **Paso 1:** BoL únicos = valores únicos de **col A** en filas donde **col B contiene `BILL_OF_LADING`** (excluye blancos).  
+2) **Paso 2:** Calcula **col N (Valor priorizado)** = H si existe, si no G, si no `No Valido`.  
+3) **Paso 3:** De los BoL únicos del Paso 1, **¿cuántos tienen col N = `No Valido`?**
 """
 )
 
@@ -153,25 +199,35 @@ if uploaded:
             st.stop()
 
         if st.button("Procesar"):
-            # Paso 1
-            unique_ids = unique_shipment_ids_where_type_contains_bol(df)
-            unique_count = len(unique_ids)
-
-            # Paso 2
+            # Paso 2 primero: calcular N
             df_out = compute_valor_priorizado(df)
 
-            # Archivo 1: Tabla Resumen (solo el conteo)
-            resumen = pd.DataFrame([{
-                "indicador": "Shipment ID únicos (col A) donde Shipment type (col B) contiene BILL_OF_LADING (sin blancos)",
-                "valor": unique_count
-            }])
+            # Paso 1: BoL únicos (A) donde B contiene BILL_OF_LADING
+            bol_unique_ids = unique_ids_where_type_contains_bill_of_lading(df_out)
+            bol_unique_count = len(bol_unique_ids)
+
+            # Paso 3: BoL únicos cuyo N = No Valido
+            bol_invalid_ids = unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df_out)
+            bol_invalid_count = len(bol_invalid_ids)
+
+            # Tabla Resumen (2 métricas)
+            resumen = pd.DataFrame([
+                {
+                    "indicador": "BoL únicos (col A) donde Shipment type (col B) contiene BILL_OF_LADING (sin blancos)",
+                    "valor": bol_unique_count,
+                },
+                {
+                    "indicador": "De esos BoL únicos, cuántos tienen Valor priorizado (col N) = No Valido",
+                    "valor": bol_invalid_count,
+                },
+            ])
 
             st.success("Listo.")
-            st.metric("Shipment ID únicos filtrados", unique_count)
-
-            # Para revisar (sin crear un 3er archivo)
-            with st.expander("Ver lista de Shipment ID únicos filtrados"):
-                st.dataframe(pd.DataFrame({"Shipment ID": unique_ids}), use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("BoL únicos (A con B contiene BILL_OF_LADING)", bol_unique_count)
+            with c2:
+                st.metric("BoL únicos con N = No Valido", bol_invalid_count)
 
             # Descargas (2 archivos)
             st.download_button(
@@ -187,6 +243,12 @@ if uploaded:
                 file_name="Archivo completo.csv",
                 mime="text/csv",
             )
+
+            with st.expander("Ver BoL únicos (filtrados)"):
+                st.dataframe(pd.DataFrame({"BoL (Shipment ID col A)": bol_unique_ids}), use_container_width=True)
+
+            with st.expander("Ver BoL únicos con N = No Valido"):
+                st.dataframe(pd.DataFrame({"BoL (Shipment ID col A)": bol_invalid_ids}), use_container_width=True)
 
             with st.expander("Vista previa (primeras 20 filas del Archivo completo)"):
                 st.dataframe(df_out.head(20), use_container_width=True)
