@@ -89,7 +89,6 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     if has_header:
         start = max(0, len(extra_names) - missing)
         for name in extra_names[start:]:
-            # Evita choque si ya existe el nombre
             col_name = name
             if col_name in df.columns:
                 i = 2
@@ -143,50 +142,37 @@ def parse_dates(series: pd.Series, mode: str) -> pd.Series:
     if mode == "DMY":
         return pd.to_datetime(series, errors="coerce", dayfirst=True)
 
-    # AUTO
     dt_mdy = pd.to_datetime(series, errors="coerce", dayfirst=False)
     dt_dmy = pd.to_datetime(series, errors="coerce", dayfirst=True)
     return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
-def fill_min_max_for_container_rows_only(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str) -> tuple[dict, dict]:
     """
-    Calcula K (Min) y L (Max) SOLO para filas donde Shipment type (col B) es Container*,
-    agrupando por BOL (col C), usando fechas de N (col N).
-
-    - Ignora blancos y "No Valido" en N.
-    - Si un BOL no tiene fechas válidas en contenedores => K y L = "No Valido" (solo en filas contenedor).
-    - NO rellena K/L en filas BILL_OF_LADING (eso queda para el siguiente paso).
+    Calcula mapas bol->min_str y bol->max_str usando SOLO filas contenedor (B contiene CONTAINER),
+    agrupando por C, tomando fechas desde N (ignorando blancos y "No Valido").
     """
-    df = df.copy()
-
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
-
-    # Contenedor: contiene CONTAINER pero NO contiene BILL_OF_LADING
     mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
 
     if mask_container.sum() == 0:
-        return df  # no hay contenedores
+        return {}, {}
 
-    bol_all = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    bol_container = bol_all[mask_container]
+    bol = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    n_raw = df.loc[mask_container].iloc[:, IDX_N_PRIORITIZED]
 
-    n_raw = df.iloc[:, IDX_N_PRIORITIZED][mask_container]
-
-    # Limpieza: convertir a None si es blanco o "No Valido"
     n_clean = n_raw.apply(
         lambda v: None
         if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
         else str(v).strip()
     )
-
     dt = parse_dates(n_clean, mode=date_mode)
 
-    sub = pd.DataFrame({"bol": bol_container, "n": n_clean, "dt": dt})
-    sub = sub[sub["bol"] != ""]  # sin BOL no se puede agrupar
+    sub = pd.DataFrame({"bol": bol, "n": n_clean, "dt": dt})
+    sub = sub[sub["bol"] != ""]
 
-    min_map = {}
-    max_map = {}
+    min_map: dict[str, str] = {}
+    max_map: dict[str, str] = {}
 
     for bol_id, g in sub.groupby("bol", sort=False):
         valid = g[g["dt"].notna()]
@@ -198,37 +184,65 @@ def fill_min_max_for_container_rows_only(df: pd.DataFrame, date_mode: str) -> pd
         min_dt = valid["dt"].min()
         max_dt = valid["dt"].max()
 
-        # mantener el string original de N para conservar formato
+        # Mantener el string original de N para preservar formato
         min_str = valid.loc[valid["dt"] == min_dt, "n"].iloc[0]
         max_str = valid.loc[valid["dt"] == max_dt, "n"].iloc[0]
 
         min_map[bol_id] = min_str
         max_map[bol_id] = max_str
 
+    return min_map, max_map
+
+
+def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
+    """Rellena K/L SOLO en filas contenedor usando col C como llave."""
+    df = df.copy()
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_container.sum() == 0:
+        return df
+
+    bol_keys = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+
     colK = df.columns[IDX_K_MIN]
     colL = df.columns[IDX_L_MAX]
 
-    # Asignar SOLO en filas contenedor
-    k_vals = bol_container.map(min_map).fillna("No Valido")
-    l_vals = bol_container.map(max_map).fillna("No Valido")
+    df.loc[mask_container, colK] = bol_keys.map(min_map).fillna("No Valido")
+    df.loc[mask_container, colL] = bol_keys.map(max_map).fillna("No Valido")
+    return df
 
-    df.loc[mask_container, colK] = k_vals
-    df.loc[mask_container, colL] = l_vals
 
+def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
+    """
+    NUEVO PASO:
+    Rellena K/L SOLO en filas BILL_OF_LADING usando el min/max calculado desde contenedores
+    (agrupado por col C).
+    """
+    df = df.copy()
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_bol.sum() == 0:
+        return df
+
+    bol_keys = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+
+    colK = df.columns[IDX_K_MIN]
+    colL = df.columns[IDX_L_MAX]
+
+    df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
+    df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
     return df
 
 
 def unique_ids_where_type_contains_bill_of_lading(df: pd.DataFrame) -> list[str]:
-    """
-    BoL únicos = Shipment ID únicos (col A) donde Shipment type (col B) contiene BILL_OF_LADING.
-    Excluye blancos en A.
-    """
+    """BoL únicos = Shipment ID únicos (col A) donde B contiene BILL_OF_LADING (excluye blancos)."""
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask = types_norm.str.contains("BILL_OF_LADING", na=False)
 
     ids = df.loc[mask].iloc[:, IDX_A_SHIPMENT_ID]
     unique_ids = set()
-
     for v in ids.tolist():
         if is_blank(v):
             continue
@@ -241,7 +255,7 @@ def unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df: pd.Data
     """
     BoL inactivos = Shipment ID únicos (col A) donde:
     - B contiene BILL_OF_LADING
-    - N == 'No Valido' (robusto a tildes/mayúsculas)
+    - N == 'No Valido'
     """
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_type = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -251,7 +265,6 @@ def unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df: pd.Data
 
     ids = df.loc[mask_type & mask_invalid].iloc[:, IDX_A_SHIPMENT_ID]
     unique_ids = set()
-
     for v in ids.tolist():
         if is_blank(v):
             continue
@@ -271,9 +284,10 @@ st.title("Reporte CSV: Tabla Resumen + Archivo completo")
 st.markdown(
     """
 **Reglas actuales:**
-1) Calcula **N (Valor priorizado)**: H si existe, si no G, si no `No Valido`.  
-2) Calcula **K (Min)** y **L (Max)** **SOLO en filas Container** (col B contiene `CONTAINER`), agrupando por **BOL (col C)** y usando **N**.  
-3) Tabla Resumen: BoL únicos, BoL inactivos (N=No Valido), BoL con fecha.
+1) N = H si existe, si no G, si no `No Valido`  
+2) Min/Max desde contenedores (B contiene CONTAINER), agrupando por C y usando N  
+   - K/L en filas Container  
+3) **Nuevo paso:** aplicar ese Min/Max también a filas BILL_OF_LADING (B contiene BILL_OF_LADING) usando su C
 """
 )
 
@@ -305,13 +319,19 @@ if uploaded:
             st.stop()
 
         if st.button("Procesar"):
-            # Paso 1: N
+            # 1) Calcular N
             df_out = compute_valor_priorizado(df)
 
-            # Paso 2: K/L SOLO para contenedores
-            df_out = fill_min_max_for_container_rows_only(df_out, date_mode=date_mode)
+            # 2) Calcular min/max desde contenedores
+            min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
 
-            # Resumen: BoL únicos / inactivos / con fecha (basado en filas BILL_OF_LADING)
+            # 2a) Aplicar a filas Container
+            df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
+
+            # 3) Aplicar a filas BILL_OF_LADING (nuevo paso)
+            df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map)
+
+            # Resumen (se mantiene tal como lo venías usando)
             bol_unique_ids = unique_ids_where_type_contains_bill_of_lading(df_out)
             bol_inactive_ids = unique_ids_where_type_contains_bill_of_lading_and_n_is_no_valido(df_out)
 
@@ -356,9 +376,6 @@ if uploaded:
                 file_name="Archivo completo.csv",
                 mime="text/csv",
             )
-
-            with st.expander("Ver BoL inactivos (Shipment ID col A)"):
-                st.dataframe(pd.DataFrame({"BoL inactivos": bol_inactive_ids}), use_container_width=True)
 
             with st.expander("Vista previa (primeras 20 filas)"):
                 st.dataframe(df_out.head(20), use_container_width=True)
