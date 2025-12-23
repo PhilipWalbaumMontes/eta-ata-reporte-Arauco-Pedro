@@ -154,6 +154,81 @@ def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
+def fill_n_for_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
+    """
+    Ajuste requerido:
+    Si una fila BILL_OF_LADING queda con N = "No Valido" (porque H/G están vacíos),
+    entonces debe tomar una fecha desde sus contenedores (mismo C):
+
+      1) Si hay al menos un container con H (ATA) válido -> usar la fecha MÍNIMA de H
+      2) Si no, pero hay G (ETA) válido -> usar la fecha MÍNIMA de G
+      3) Si no hay nada -> mantiene "No Valido"
+    """
+    df = df.copy()
+
+    types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
+    mask_container = types_norm.str.contains("CONTAINER", na=False) & ~types_norm.str.contains("BILL_OF_LADING", na=False)
+    mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
+
+    if mask_bol.sum() == 0 or mask_container.sum() == 0:
+        return df
+
+    bol_cont = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    h_raw = df.loc[mask_container].iloc[:, IDX_H_ACTUAL]
+    g_raw = df.loc[mask_container].iloc[:, IDX_G_ESTIMATED]
+
+    def clean_date_str(v):
+        if is_blank(v):
+            return None
+        if normalize_text_for_compare(v) == "no valido":
+            return None
+        return str(v).strip()
+
+    h_clean = h_raw.apply(clean_date_str)
+    g_clean = g_raw.apply(clean_date_str)
+
+    dayfirst = None
+    if date_mode == "AUTO":
+        combined = pd.concat([h_clean, g_clean], ignore_index=True)
+        dt_mdy = pd.to_datetime(combined, errors="coerce", dayfirst=False)
+        dt_dmy = pd.to_datetime(combined, errors="coerce", dayfirst=True)
+        dayfirst = dt_dmy.notna().sum() > dt_mdy.notna().sum()
+
+    h_dt = parse_dates(h_clean, mode=date_mode, dayfirst=dayfirst)
+    g_dt = parse_dates(g_clean, mode=date_mode, dayfirst=dayfirst)
+
+    sub = pd.DataFrame({"bol": bol_cont, "h": h_clean, "g": g_clean, "h_dt": h_dt, "g_dt": g_dt})
+    sub = sub[sub["bol"] != ""]
+
+    bol_n_map = {}
+    for bol_id, grp in sub.groupby("bol", sort=False):
+        valid_h = grp[grp["h_dt"].notna()]
+        if not valid_h.empty:
+            min_dt = valid_h["h_dt"].min()
+            bol_n_map[bol_id] = valid_h.loc[valid_h["h_dt"] == min_dt, "h"].iloc[0]
+            continue
+
+        valid_g = grp[grp["g_dt"].notna()]
+        if not valid_g.empty:
+            min_dt = valid_g["g_dt"].min()
+            bol_n_map[bol_id] = valid_g.loc[valid_g["g_dt"] == min_dt, "g"].iloc[0]
+            continue
+
+        bol_n_map[bol_id] = "No Valido"
+
+    n_col = df.columns[IDX_N_PRIORITIZED]
+
+    bol_keys_bol = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    n_norm = df.loc[mask_bol, n_col].apply(normalize_text_for_compare)
+    override = (n_norm == "") | (n_norm == "no valido")
+
+    mapped = bol_keys_bol.map(bol_n_map)
+    idx_override = df.loc[mask_bol].index[override]
+    df.loc[idx_override, n_col] = mapped.loc[override].fillna("No Valido")
+
+    return df
+
+
 def min_max_from_row_g_h(g_val, h_val, date_mode: str) -> tuple[str, str]:
     """
     Para el caso especial (archivo con 1 solo valor único en C):
@@ -258,13 +333,13 @@ def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) 
 
 def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict, date_mode: str) -> pd.DataFrame:
     """
-    Rellena K/L SOLO en filas BILL_OF_LADING.
+    K/L para filas BILL_OF_LADING:
 
-    CORRECCIÓN (lo que pediste):
     - Si el archivo tiene SOLO 1 valor único (no vacío) en C:
-        Para BOL: K/L desde su propia fila usando MIN/MAX entre G y H.
+        K/L desde su propia fila usando MIN/MAX entre G y H.
+        (Si G/H no válidos, hace fallback a contenedores si existieran.)
     - Si el archivo tiene MÁS de 1 valor en C:
-        Para BOL: K/L SIEMPRE desde contenedores (min_map/max_map), NO desde su propia fila.
+        K/L SIEMPRE desde contenedores (min_map/max_map), NO desde su propia fila.
     """
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
@@ -281,15 +356,20 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
     only_one_unique_in_file = len(unique_nonblank_c) == 1
 
     if only_one_unique_in_file:
-        # Caso especial: K/L salen del propio BOL usando G/H
+        bol_indexes = df.loc[mask_bol].index.tolist()
         k_values = []
         l_values = []
-        bol_indexes = df.loc[mask_bol].index.tolist()
 
         for idx in bol_indexes:
             g_val = df.at[idx, df.columns[IDX_G_ESTIMATED]]
             h_val = df.at[idx, df.columns[IDX_H_ACTUAL]]
             mn, mx = min_max_from_row_g_h(g_val, h_val, date_mode=date_mode)
+
+            if mn == "No Valido" and mx == "No Valido":
+                key = clean_bol_key(df.at[idx, df.columns[IDX_C_BOL]])
+                mn = min_map.get(key, "No Valido")
+                mx = max_map.get(key, "No Valido")
+
             k_values.append(mn)
             l_values.append(mx)
 
@@ -398,20 +478,15 @@ def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
 
     bol_df = df_out.loc[mask_bol].copy()
 
-    # BoL único por columna A (Shipment ID) - excluir blancos
     bol_df["_bl_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
     bol_df = bol_df[bol_df["_bl_id"].notna()]
-
-    # Un registro por BL (por si hay duplicados)
     bol_df = bol_df.drop_duplicates(subset=["_bl_id"], keep="first")
 
     bl_unicos = int(bol_df["_bl_id"].nunique())
 
-    # BL válidos: N no blanco y N != No Valido
     n_norm = bol_df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
     bl_validos = int(((n_norm != "") & (n_norm != "no valido")).sum())
 
-    # Rangos por O
     o_val = bol_df.iloc[:, IDX_O_RANGE].apply(lambda v: "" if is_blank(v) else str(v).strip())
     diff_0 = int((o_val == "0").sum())
     diff_0_24 = int((o_val == "0 - 24 Hrs").sum())
@@ -462,6 +537,9 @@ if uploaded:
 
         if st.button("Procesar"):
             df_out = compute_valor_priorizado(df)
+
+            # ✅ NUEVO: si el BOL no tiene G/H, traer N desde contenedores del mismo C
+            df_out = fill_n_for_bol_from_containers(df_out, date_mode=date_mode)
 
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
 
