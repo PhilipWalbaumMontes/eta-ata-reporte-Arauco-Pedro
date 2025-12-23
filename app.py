@@ -220,7 +220,14 @@ def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) 
 
 
 def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
-    """Rellena K/L SOLO en filas BILL_OF_LADING usando el min/max calculado desde contenedores."""
+    """
+    Rellena K/L SOLO en filas BILL_OF_LADING.
+
+    Regla nueva:
+    - Si un valor de la columna C aparece SOLO 1 vez en todo el archivo y esa fila es BILL_OF_LADING,
+      entonces K = N (Valor priorizado) de esa misma fila y L = N de esa misma fila.
+    - Si C aparece >1 vez, se mantiene la lógica actual (min/max desde contenedores usando min_map/max_map).
+    """
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
     mask_bol = types_norm.str.contains("BILL_OF_LADING", na=False)
@@ -228,13 +235,42 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
     if mask_bol.sum() == 0:
         return df
 
-    bol_keys = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
-
     colK = df.columns[IDX_K_MIN]
     colL = df.columns[IDX_L_MAX]
 
-    df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
-    df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
+    # Conteo de ocurrencias de C en TODO el archivo (incluyendo blancos)
+    all_keys = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    nonblank_counts = all_keys[all_keys != ""].value_counts()
+    blank_count = int((all_keys == "").sum())
+
+    def is_singleton_key(k: str) -> bool:
+        if k == "":
+            return blank_count == 1
+        return int(nonblank_counts.get(k, 0)) == 1
+
+    # Keys solo de filas BILL_OF_LADING
+    bol_keys = all_keys[mask_bol]
+
+    # Valores normales desde contenedores (si existen)
+    mapped_k = bol_keys.map(min_map)
+    mapped_l = bol_keys.map(max_map)
+
+    # Caso singleton: usar N de la MISMA fila
+    singleton = bol_keys.apply(is_singleton_key)
+
+    n_self = df.loc[mask_bol].iloc[:, IDX_N_PRIORITIZED].apply(
+        lambda v: "No Valido"
+        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
+        else str(v).strip()
+    )
+
+    # Override SOLO cuando es singleton
+    mapped_k.loc[singleton] = n_self.loc[singleton]
+    mapped_l.loc[singleton] = n_self.loc[singleton]
+
+    df.loc[mask_bol, colK] = mapped_k.fillna("No Valido")
+    df.loc[mask_bol, colL] = mapped_l.fillna("No Valido")
+
     return df
 
 
