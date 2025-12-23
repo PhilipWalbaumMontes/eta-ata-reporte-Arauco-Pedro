@@ -156,19 +156,18 @@ def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
 
 def min_max_from_row_g_h(g_val, h_val, date_mode: str) -> tuple[str, str]:
     """
-    Calcula (Min, Max) desde la MISMA FILA usando G/H:
-      - Min = fecha más antigua
-      - Max = fecha más reciente
+    Para el caso especial (archivo con 1 solo valor único en C):
+    calcula Min/Max usando SOLO las fechas de la misma fila (G y H).
     """
-    def clean(v):
+    def clean_date_cell(v):
         if is_blank(v):
             return None
         if normalize_text_for_compare(v) == "no valido":
             return None
         return str(v).strip()
 
-    g_str = clean(g_val)
-    h_str = clean(h_val)
+    g_str = clean_date_cell(g_val)
+    h_str = clean_date_cell(h_val)
 
     if g_str is None and h_str is None:
         return "No Valido", "No Valido"
@@ -261,12 +260,11 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
     """
     Rellena K/L SOLO en filas BILL_OF_LADING.
 
-    - Caso especial A: si en TODO el archivo existe SOLO 1 valor único (no vacío) en C:
-        Para filas BILL_OF_LADING: K/L salen de su propia fila (MIN/MAX entre G y H).
-    - Caso especial B: si un C aparece SOLO 1 vez en todo el archivo y esa fila es BILL_OF_LADING:
-        Para esa fila: K/L salen de su propia fila (MIN/MAX entre G y H).
-    - Si no aplica A ni B:
-        K/L vienen de contenedores (min_map/max_map).
+    CORRECCIÓN (lo que pediste):
+    - Si el archivo tiene SOLO 1 valor único (no vacío) en C:
+        Para BOL: K/L desde su propia fila usando MIN/MAX entre G y H.
+    - Si el archivo tiene MÁS de 1 valor en C:
+        Para BOL: K/L SIEMPRE desde contenedores (min_map/max_map), NO desde su propia fila.
     """
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
@@ -279,31 +277,30 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
     colL = df.columns[IDX_L_MAX]
 
     all_keys = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    unique_nonblank_c = pd.unique(all_keys[all_keys != ""])
+    only_one_unique_in_file = len(unique_nonblank_c) == 1
 
-    unique_nonblank = pd.unique(all_keys[all_keys != ""])
-    only_one_unique_in_file = len(unique_nonblank) == 1
+    if only_one_unique_in_file:
+        # Caso especial: K/L salen del propio BOL usando G/H
+        k_values = []
+        l_values = []
+        bol_indexes = df.loc[mask_bol].index.tolist()
 
-    counts = all_keys.value_counts(dropna=False)
-    bol_keys = all_keys[mask_bol]
-
-    k_values = []
-    l_values = []
-
-    for idx, key in zip(df.loc[mask_bol].index.tolist(), bol_keys.tolist()):
-        singleton_c = int(counts.get(key, 0)) == 1
-
-        if only_one_unique_in_file or singleton_c:
+        for idx in bol_indexes:
             g_val = df.at[idx, df.columns[IDX_G_ESTIMATED]]
             h_val = df.at[idx, df.columns[IDX_H_ACTUAL]]
             mn, mx = min_max_from_row_g_h(g_val, h_val, date_mode=date_mode)
             k_values.append(mn)
             l_values.append(mx)
-        else:
-            k_values.append(min_map.get(key, "No Valido"))
-            l_values.append(max_map.get(key, "No Valido"))
 
-    df.loc[mask_bol, colK] = pd.Series(k_values, index=df.loc[mask_bol].index).fillna("No Valido")
-    df.loc[mask_bol, colL] = pd.Series(l_values, index=df.loc[mask_bol].index).fillna("No Valido")
+        df.loc[mask_bol, colK] = pd.Series(k_values, index=bol_indexes).fillna("No Valido")
+        df.loc[mask_bol, colL] = pd.Series(l_values, index=bol_indexes).fillna("No Valido")
+        return df
+
+    # Caso normal: más de 1 valor en C -> BOL toma min/max desde contenedores
+    bol_keys = all_keys[mask_bol]
+    df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
+    df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
     return df
 
 
@@ -401,15 +398,20 @@ def build_summary_counts(df_out: pd.DataFrame) -> pd.DataFrame:
 
     bol_df = df_out.loc[mask_bol].copy()
 
+    # BoL único por columna A (Shipment ID) - excluir blancos
     bol_df["_bl_id"] = bol_df.iloc[:, IDX_A_SHIPMENT_ID].apply(lambda v: None if is_blank(v) else str(v).strip())
     bol_df = bol_df[bol_df["_bl_id"].notna()]
+
+    # Un registro por BL (por si hay duplicados)
     bol_df = bol_df.drop_duplicates(subset=["_bl_id"], keep="first")
 
     bl_unicos = int(bol_df["_bl_id"].nunique())
 
+    # BL válidos: N no blanco y N != No Valido
     n_norm = bol_df.iloc[:, IDX_N_PRIORITIZED].apply(normalize_text_for_compare)
     bl_validos = int(((n_norm != "") & (n_norm != "no valido")).sum())
 
+    # Rangos por O
     o_val = bol_df.iloc[:, IDX_O_RANGE].apply(lambda v: "" if is_blank(v) else str(v).strip())
     diff_0 = int((o_val == "0").sum())
     diff_0_24 = int((o_val == "0 - 24 Hrs").sum())
