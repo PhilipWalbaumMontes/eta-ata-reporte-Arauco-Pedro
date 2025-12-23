@@ -109,30 +109,6 @@ def ensure_min_columns(df: pd.DataFrame, has_header: bool) -> pd.DataFrame:
     return df
 
 
-def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Columna N (Valor priorizado):
-    - Si H tiene valor -> N = H
-    - Si no, si G tiene valor -> N = G
-    - Si no -> "No Valido"
-    """
-    df = df.copy()
-    g = df.iloc[:, IDX_G_ESTIMATED]
-    h = df.iloc[:, IDX_H_ACTUAL]
-
-    out = []
-    for hv, gv in zip(h.tolist(), g.tolist()):
-        if not is_blank(hv):
-            out.append(str(hv).strip())
-        elif not is_blank(gv):
-            out.append(str(gv).strip())
-        else:
-            out.append("No Valido")
-
-    df.iloc[:, IDX_N_PRIORITIZED] = out
-    return df
-
-
 def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     """
     mode:
@@ -154,15 +130,43 @@ def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
+def compute_valor_priorizado(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Columna N (Valor priorizado) BASE (por fila):
+    - Si H tiene valor -> N = H
+    - Si no, si G tiene valor -> N = G
+    - Si no -> "No Valido"
+    """
+    df = df.copy()
+    g = df.iloc[:, IDX_G_ESTIMATED]
+    h = df.iloc[:, IDX_H_ACTUAL]
+
+    out = []
+    for hv, gv in zip(h.tolist(), g.tolist()):
+        if not is_blank(hv):
+            out.append(str(hv).strip())
+        elif not is_blank(gv):
+            out.append(str(gv).strip())
+        else:
+            out.append("No Valido")
+
+    df.iloc[:, IDX_N_PRIORITIZED] = out
+    return df
+
+
 def fill_n_for_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataFrame:
     """
-    Ajuste requerido:
-    Si una fila BILL_OF_LADING queda con N = "No Valido" (porque H/G están vacíos),
-    entonces debe tomar una fecha desde sus contenedores (mismo C):
+    CORRECCIÓN solicitada para N (Valor priorizado) en filas BILL_OF_LADING:
 
-      1) Si hay al menos un container con H (ATA) válido -> usar la fecha MÍNIMA de H
-      2) Si no, pero hay G (ETA) válido -> usar la fecha MÍNIMA de G
-      3) Si no hay nada -> mantiene "No Valido"
+    Para filas donde B = BILL_OF_LADING:
+      - Si la propia fila tiene H -> N = H
+      - Si no, si tiene G -> N = G
+      - Si NO tiene G NI H (ambos vacíos), entonces N se toma desde CONTENEDORES (mismo C):
+          1) Si hay contenedores con H (ATA) => usar la H MÁS ANTIGUA (mínima). Si no parsea, usar la primera H encontrada.
+          2) Si no hay H pero sí G (ETA) => usar la G MÁS ANTIGUA (mínima). Si no parsea, usar la primera G encontrada.
+          3) Si no hay nada => N = "No Valido"
+
+    Así, un BOL NO queda "No Valido" si sus contenedores sí tienen información.
     """
     df = df.copy()
 
@@ -173,10 +177,6 @@ def fill_n_for_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataF
     if mask_bol.sum() == 0 or mask_container.sum() == 0:
         return df
 
-    bol_cont = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    h_raw = df.loc[mask_container].iloc[:, IDX_H_ACTUAL]
-    g_raw = df.loc[mask_container].iloc[:, IDX_G_ESTIMATED]
-
     def clean_date_str(v):
         if is_blank(v):
             return None
@@ -184,65 +184,94 @@ def fill_n_for_bol_from_containers(df: pd.DataFrame, date_mode: str) -> pd.DataF
             return None
         return str(v).strip()
 
-    h_clean = h_raw.apply(clean_date_str)
-    g_clean = g_raw.apply(clean_date_str)
+    # ----- Armar mapa por C desde contenedores -----
+    cont_keys = df.loc[mask_container].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    cont_h = df.loc[mask_container].iloc[:, IDX_H_ACTUAL].apply(clean_date_str)
+    cont_g = df.loc[mask_container].iloc[:, IDX_G_ESTIMATED].apply(clean_date_str)
 
+    # dayfirst para AUTO (con contenedores)
     dayfirst = None
     if date_mode == "AUTO":
-        combined = pd.concat([h_clean, g_clean], ignore_index=True)
+        combined = pd.concat([cont_h, cont_g], ignore_index=True)
         dt_mdy = pd.to_datetime(combined, errors="coerce", dayfirst=False)
         dt_dmy = pd.to_datetime(combined, errors="coerce", dayfirst=True)
         dayfirst = dt_dmy.notna().sum() > dt_mdy.notna().sum()
 
-    h_dt = parse_dates(h_clean, mode=date_mode, dayfirst=dayfirst)
-    g_dt = parse_dates(g_clean, mode=date_mode, dayfirst=dayfirst)
+    cont_h_dt = parse_dates(cont_h, mode=date_mode, dayfirst=dayfirst)
+    cont_g_dt = parse_dates(cont_g, mode=date_mode, dayfirst=dayfirst)
 
-    sub = pd.DataFrame({"bol": bol_cont, "h": h_clean, "g": g_clean, "h_dt": h_dt, "g_dt": g_dt})
+    sub = pd.DataFrame(
+        {
+            "bol": cont_keys,
+            "h": cont_h,
+            "g": cont_g,
+            "h_dt": cont_h_dt,
+            "g_dt": cont_g_dt,
+        },
+        index=df.loc[mask_container].index,
+    )
+
+    # Ignorar C vacío para mapear
     sub = sub[sub["bol"] != ""]
 
-    bol_n_map = {}
+    bol_to_n = {}
     for bol_id, grp in sub.groupby("bol", sort=False):
-        valid_h = grp[grp["h_dt"].notna()]
-        if not valid_h.empty:
-            min_dt = valid_h["h_dt"].min()
-            bol_n_map[bol_id] = valid_h.loc[valid_h["h_dt"] == min_dt, "h"].iloc[0]
+        # Preferir H (ATA) si existe cualquier valor no vacío
+        any_h = grp["h"].notna().any()
+        if any_h:
+            valid_h = grp[grp["h_dt"].notna()]
+            if not valid_h.empty:
+                min_dt = valid_h["h_dt"].min()
+                bol_to_n[bol_id] = valid_h.loc[valid_h["h_dt"] == min_dt, "h"].iloc[0]
+            else:
+                # si no parsea, usar la primera H no vacía
+                bol_to_n[bol_id] = grp.loc[grp["h"].notna(), "h"].iloc[0]
             continue
 
-        valid_g = grp[grp["g_dt"].notna()]
-        if not valid_g.empty:
-            min_dt = valid_g["g_dt"].min()
-            bol_n_map[bol_id] = valid_g.loc[valid_g["g_dt"] == min_dt, "g"].iloc[0]
+        # Si no hay H, usar G (ETA) si existe cualquier valor no vacío
+        any_g = grp["g"].notna().any()
+        if any_g:
+            valid_g = grp[grp["g_dt"].notna()]
+            if not valid_g.empty:
+                min_dt = valid_g["g_dt"].min()
+                bol_to_n[bol_id] = valid_g.loc[valid_g["g_dt"] == min_dt, "g"].iloc[0]
+            else:
+                bol_to_n[bol_id] = grp.loc[grp["g"].notna(), "g"].iloc[0]
             continue
 
-        bol_n_map[bol_id] = "No Valido"
+        bol_to_n[bol_id] = "No Valido"
 
-    n_col = df.columns[IDX_N_PRIORITIZED]
+    # ----- Aplicar SOLO cuando la fila BOL no tiene ni G ni H -----
+    bol_keys = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
+    bol_g = df.loc[mask_bol].iloc[:, IDX_G_ESTIMATED]
+    bol_h = df.loc[mask_bol].iloc[:, IDX_H_ACTUAL]
 
-    bol_keys_bol = df.loc[mask_bol].iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    n_norm = df.loc[mask_bol, n_col].apply(normalize_text_for_compare)
-    override = (n_norm == "") | (n_norm == "no valido")
+    needs_container_n = bol_g.apply(is_blank) & bol_h.apply(is_blank)
 
-    mapped = bol_keys_bol.map(bol_n_map)
-    idx_override = df.loc[mask_bol].index[override]
-    df.loc[idx_override, n_col] = mapped.loc[override].fillna("No Valido")
+    if needs_container_n.any():
+        n_col = df.columns[IDX_N_PRIORITIZED]
+        idx_to_update = df.loc[mask_bol].index[needs_container_n]
+        keys_to_update = bol_keys.loc[needs_container_n]
+        df.loc[idx_to_update, n_col] = keys_to_update.map(bol_to_n).fillna("No Valido").values
 
     return df
 
 
 def min_max_from_row_g_h(g_val, h_val, date_mode: str) -> tuple[str, str]:
     """
-    Para el caso especial (archivo con 1 solo valor único en C):
-    calcula Min/Max usando SOLO las fechas de la misma fila (G y H).
+    Calcula (Min, Max) desde la MISMA FILA usando G/H:
+      - Min = fecha más antigua
+      - Max = fecha más reciente
     """
-    def clean_date_cell(v):
+    def clean(v):
         if is_blank(v):
             return None
         if normalize_text_for_compare(v) == "no valido":
             return None
         return str(v).strip()
 
-    g_str = clean_date_cell(g_val)
-    h_str = clean_date_cell(h_val)
+    g_str = clean(g_val)
+    h_str = clean(h_val)
 
     if g_str is None and h_str is None:
         return "No Valido", "No Valido"
@@ -337,7 +366,7 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
 
     - Si el archivo tiene SOLO 1 valor único (no vacío) en C:
         K/L desde su propia fila usando MIN/MAX entre G y H.
-        (Si G/H no válidos, hace fallback a contenedores si existieran.)
+        Si G/H no válidos, hace fallback a contenedores.
     - Si el archivo tiene MÁS de 1 valor en C:
         K/L SIEMPRE desde contenedores (min_map/max_map), NO desde su propia fila.
     """
@@ -377,7 +406,6 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
         df.loc[mask_bol, colL] = pd.Series(l_values, index=bol_indexes).fillna("No Valido")
         return df
 
-    # Caso normal: más de 1 valor en C -> BOL toma min/max desde contenedores
     bol_keys = all_keys[mask_bol]
     df.loc[mask_bol, colK] = bol_keys.map(min_map).fillna("No Valido")
     df.loc[mask_bol, colL] = bol_keys.map(max_map).fillna("No Valido")
@@ -538,7 +566,7 @@ if uploaded:
         if st.button("Procesar"):
             df_out = compute_valor_priorizado(df)
 
-            # ✅ NUEVO: si el BOL no tiene G/H, traer N desde contenedores del mismo C
+            # ✅ CORRECCIÓN CLAVE: N para BOL se completa desde contenedores si su G/H están vacíos
             df_out = fill_n_for_bol_from_containers(df_out, date_mode=date_mode)
 
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
