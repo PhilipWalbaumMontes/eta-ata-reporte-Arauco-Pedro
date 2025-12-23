@@ -154,6 +154,44 @@ def parse_dates(series: pd.Series, mode: str, dayfirst=None) -> pd.Series:
     return dt_dmy if dt_dmy.notna().sum() > dt_mdy.notna().sum() else dt_mdy
 
 
+def min_max_from_row_g_h(g_val, h_val, date_mode: str) -> tuple[str, str]:
+    """
+    Para el caso singleton (solo 1 fila en ese C y es BILL_OF_LADING):
+    calcula Min/Max usando SOLO las fechas de la misma fila (G y H).
+    """
+    def clean_date_cell(v):
+        if is_blank(v):
+            return None
+        if normalize_text_for_compare(v) == "no valido":
+            return None
+        return str(v).strip()
+
+    g_str = clean_date_cell(g_val)
+    h_str = clean_date_cell(h_val)
+
+    if g_str is None and h_str is None:
+        return "No Valido", "No Valido"
+    if g_str is not None and h_str is None:
+        return g_str, g_str
+    if g_str is None and h_str is not None:
+        return h_str, h_str
+
+    # ambos existen, decidir por fecha más antigua / más futura
+    dt = parse_dates(pd.Series([g_str, h_str]), mode=date_mode)
+    g_dt, h_dt = dt.iloc[0], dt.iloc[1]
+
+    if pd.isna(g_dt) and pd.isna(h_dt):
+        return "No Valido", "No Valido"
+    if pd.isna(g_dt) and not pd.isna(h_dt):
+        return h_str, h_str
+    if not pd.isna(g_dt) and pd.isna(h_dt):
+        return g_str, g_str
+
+    if g_dt <= h_dt:
+        return g_str, h_str
+    return h_str, g_str
+
+
 def compute_min_max_maps_from_containers(df: pd.DataFrame, date_mode: str):
     """
     Calcula mapas bol->min_str y bol->max_str usando SOLO filas contenedor (B contiene CONTAINER),
@@ -219,14 +257,15 @@ def fill_k_l_for_container_rows(df: pd.DataFrame, min_map: dict, max_map: dict) 
     return df
 
 
-def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict) -> pd.DataFrame:
+def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_map: dict, date_mode: str) -> pd.DataFrame:
     """
     Rellena K/L SOLO en filas BILL_OF_LADING.
 
-    Regla nueva:
-    - Si un valor de la columna C aparece SOLO 1 vez en todo el archivo y esa fila es BILL_OF_LADING,
-      entonces K = N (Valor priorizado) de esa misma fila y L = N de esa misma fila.
-    - Si C aparece >1 vez, se mantiene la lógica actual (min/max desde contenedores usando min_map/max_map).
+    Regla:
+    - Si un C aparece SOLO 1 vez en todo el archivo y esa fila es BILL_OF_LADING:
+        K/L se calculan desde la MISMA FILA usando G y H (min y max).
+    - Si C aparece >1 vez:
+        K/L se rellenan con min/max desde contenedores (min_map/max_map).
     """
     df = df.copy()
     types_norm = df.iloc[:, IDX_B_SHIPMENT_TYPE].apply(normalize_type)
@@ -238,38 +277,30 @@ def fill_k_l_for_bol_rows_from_containers(df: pd.DataFrame, min_map: dict, max_m
     colK = df.columns[IDX_K_MIN]
     colL = df.columns[IDX_L_MAX]
 
-    # Conteo de ocurrencias de C en TODO el archivo (incluyendo blancos)
     all_keys = df.iloc[:, IDX_C_BOL].apply(clean_bol_key)
-    nonblank_counts = all_keys[all_keys != ""].value_counts()
-    blank_count = int((all_keys == "").sum())
+    counts = all_keys.value_counts(dropna=False)
 
-    def is_singleton_key(k: str) -> bool:
-        if k == "":
-            return blank_count == 1
-        return int(nonblank_counts.get(k, 0)) == 1
-
-    # Keys solo de filas BILL_OF_LADING
+    bol_df = df.loc[mask_bol].copy()
     bol_keys = all_keys[mask_bol]
 
-    # Valores normales desde contenedores (si existen)
-    mapped_k = bol_keys.map(min_map)
-    mapped_l = bol_keys.map(max_map)
+    k_values = []
+    l_values = []
 
-    # Caso singleton: usar N de la MISMA fila
-    singleton = bol_keys.apply(is_singleton_key)
+    for idx, key in zip(bol_df.index.tolist(), bol_keys.tolist()):
+        is_singleton = int(counts.get(key, 0)) == 1
 
-    n_self = df.loc[mask_bol].iloc[:, IDX_N_PRIORITIZED].apply(
-        lambda v: "No Valido"
-        if (is_blank(v) or normalize_text_for_compare(v) == "no valido")
-        else str(v).strip()
-    )
+        if is_singleton:
+            g_val = df.at[idx, df.columns[IDX_G_ESTIMATED]]
+            h_val = df.at[idx, df.columns[IDX_H_ACTUAL]]
+            mn, mx = min_max_from_row_g_h(g_val, h_val, date_mode=date_mode)
+            k_values.append(mn)
+            l_values.append(mx)
+        else:
+            k_values.append(min_map.get(key, "No Valido"))
+            l_values.append(max_map.get(key, "No Valido"))
 
-    # Override SOLO cuando es singleton
-    mapped_k.loc[singleton] = n_self.loc[singleton]
-    mapped_l.loc[singleton] = n_self.loc[singleton]
-
-    df.loc[mask_bol, colK] = mapped_k.fillna("No Valido")
-    df.loc[mask_bol, colL] = mapped_l.fillna("No Valido")
+    df.loc[mask_bol, colK] = pd.Series(k_values, index=df.loc[mask_bol].index).fillna("No Valido")
+    df.loc[mask_bol, colL] = pd.Series(l_values, index=df.loc[mask_bol].index).fillna("No Valido")
 
     return df
 
@@ -436,7 +467,7 @@ if uploaded:
             min_map, max_map = compute_min_max_maps_from_containers(df_out, date_mode=date_mode)
 
             df_out = fill_k_l_for_container_rows(df_out, min_map=min_map, max_map=max_map)
-            df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map)
+            df_out = fill_k_l_for_bol_rows_from_containers(df_out, min_map=min_map, max_map=max_map, date_mode=date_mode)
 
             df_out = fill_hours_diff_in_j(df_out, date_mode=date_mode)
             df_out = fill_range_in_o(df_out)
